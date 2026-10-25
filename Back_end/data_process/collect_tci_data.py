@@ -22,7 +22,7 @@ OUT_DIR  = BASE + "/urban-accessibility-rebuild/Back_end/data_process/output"
 CACHE_FILE = OUT_DIR + "/tci_cache.json"
 OUT_FILE   = OUT_DIR + "/tci_raw_data.json"
 
-API_KEY  = "fed24f8ba01f3a3561e828031553b68b"
+API_KEY = os.environ.get("AMAP_API_KEY", "")
 
 # 东西城边界
 EW_LON_MIN, EW_LON_MAX = 116.30, 116.47
@@ -132,6 +132,7 @@ def get_driving_time(o_lon, o_lat, d_lon, d_lat, timestamp):
 
 # ── 主程序 ────────────────────────────────────
 def main():
+    raise RuntimeError('此旧脚本的历史时段与高德调用参数不可靠，已禁用；请从本地系统的“导航抽样”运行即时采集。')
     # 读取东西城网格
     print("→ 读取东西城网格...")
     grid = gpd.read_file(GRID_FILE)

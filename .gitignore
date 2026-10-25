@@ -12,3 +12,9 @@ src.zip
 .env
 .env.*
 !.env.example
+# Local runtimes, checkpoints and generated media
+__pycache__/
+*.py[cod]
+.Rhistory
+*.mp4
+*.pdf

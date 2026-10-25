@@ -1,0 +1,10 @@
+numpy>=1.24,<2
+pandas
+scipy
+geopandas
+pyogrio
+shapely>=2
+pyproj
+openpyxl
+rasterio>=1.4,<1.5
+affine>=2.4,<3

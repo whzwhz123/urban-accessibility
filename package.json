@@ -20,7 +20,7 @@
         "echarts-for-react": "^3.0.2",
         "js-graph-algorithms": "^1.0.18",
         "mapbox-gl": "^2.15.0",
-        "maplibre-gl": "^5.16.0",
+        "maplibre-gl": "4.7.1",
         "nanoid": "^5.0.1",
         "pubsub-js": "^1.9.4",
         "react": "^18.3.1",
@@ -40,10 +40,11 @@
         "worker-loader": "^3.0.8"
     },
     "scripts": {
-        "start": "react-app-rewired start",
+        "start": "node scripts/start_local.js",
         "build": "react-app-rewired build",
         "test": "react-scripts test",
-        "eject": "react-scripts eject"
+        "eject": "react-scripts eject",
+        "start:web": "react-app-rewired start"
     },
     "devDependencies": {
         "@testing-library/jest-dom": "^6.1.4",
@@ -77,5 +78,6 @@
             "last 1 firefox version",
             "last 1 safari version"
         ]
-    }
+    },
+    "proxy": "http://127.0.0.1:8765"
 }

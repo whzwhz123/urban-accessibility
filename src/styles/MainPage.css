@@ -40,7 +40,8 @@
     overflow-y: auto !important;
     overflow-x: hidden !important;
     /* hidden 防止横向滚动 */
-    max-height: calc(100vh - 120px);
+    min-height: 0;
+    max-height: none;
 }
 
 .floating-sidebar .ant-tabs-content-holder::-webkit-scrollbar {

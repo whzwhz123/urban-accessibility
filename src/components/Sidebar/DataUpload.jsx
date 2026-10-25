@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { Upload, Button, Progress, message, Space } from 'antd';
 import { UploadOutlined, DeleteOutlined } from '@ant-design/icons';
+import CitySelector from './CitySelector';
 
-const DataUpload = ({ geoData, onDataUpdate }) => {
+const DataUpload = ({ city, onCityChange, geoData, onDataUpdate }) => {
   const [loading, setLoading] = useState(false);
   const pendingFiles = React.useRef([]);
   const pendingTimer = React.useRef(null);
@@ -41,13 +42,14 @@ const DataUpload = ({ geoData, onDataUpdate }) => {
 
   return (
     <div className="sidebar-content-wrapper" style={{ padding: '14px 14px' }}>
+      <CitySelector city={city} onCityChange={onCityChange} />
       {/* 统计行 */}
       <div style={{
         display: 'flex', justifyContent: 'space-between',
         padding: '7px 0', borderBottom: '1px solid rgba(255,255,255,0.06)',
         fontSize: 12, color: 'rgba(255,255,255,0.45)',
       }}>
-        <span>已加载线路</span>
+        <span>手动导入线路</span>
         <span style={{ color: 'rgba(255,255,255,0.75)', fontWeight: 600 }}>{routes} 条</span>
       </div>
       <div style={{
@@ -56,7 +58,7 @@ const DataUpload = ({ geoData, onDataUpdate }) => {
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         fontSize: 12, color: 'rgba(255,255,255,0.45)',
       }}>
-        <span>已加载站点</span>
+        <span>手动导入站点</span>
         <span style={{ color: 'rgba(255,255,255,0.75)', fontWeight: 600 }}>{stops} 个</span>
       </div>
 

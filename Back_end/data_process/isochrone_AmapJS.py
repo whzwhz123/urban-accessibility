@@ -1,79 +1,68 @@
+"""Generate a resumable BUS-only ArrivalRange script for the official AMap demo."""
+import argparse
+import hashlib
 import json
-grid = json.load(open('/Users/aaa/Desktop/Major Thesis/System_build/urban-accessibility-rebuild/Back_end/data_process/output/demand_grid.geojson'))
+from pathlib import Path
+import sys
 
-script = '''
-(async function() {
-var GRID_JSON = ''' + json.dumps(grid) + ''';
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from Back_end.city_poi import gcj02_to_wgs84
+from shapely.geometry import shape
 
-function wgs84ToGcj02(lon, lat) {
-    var a=6378245.0,ee=0.00669342162296594323,pi=Math.PI;
-    function tLat(x,y){var r=-100+2*x+3*y+0.2*y*y+0.1*x*y+0.2*Math.sqrt(Math.abs(x));r+=(20*Math.sin(6*x*pi)+20*Math.sin(2*x*pi))*2/3;r+=(20*Math.sin(y*pi)+40*Math.sin(y/3*pi))*2/3;r+=(160*Math.sin(y/12*pi)+320*Math.sin(y*pi/30))*2/3;return r;}
-    function tLon(x,y){var r=300+x+2*y+0.1*x*x+0.1*x*y+0.1*Math.sqrt(Math.abs(x));r+=(20*Math.sin(6*x*pi)+20*Math.sin(2*x*pi))*2/3;r+=(20*Math.sin(x*pi)+40*Math.sin(x/3*pi))*2/3;r+=(150*Math.sin(x/12*pi)+300*Math.sin(x/30*pi))*2/3;return r;}
-    var dLat=tLat(lon-105,lat-35),dLon=tLon(lon-105,lat-35);
-    var radLat=lat/180*pi,magic=Math.sin(radLat);
-    magic=1-ee*magic*magic;var sq=Math.sqrt(magic);
-    return [lon+(dLon*180)/(a/sq*Math.cos(radLat)*pi),lat+(dLat*180)/((a*(1-ee))/(magic*sq)*pi)];
-}
+ROOT = Path(__file__).resolve().parents[2]
 
-var grids = GRID_JSON.features.map(function(f,i){
-    var g=f.geometry,cx,cy;
-    if(g.type===\'Polygon\'){var r=g.coordinates[0];cx=r.reduce(function(s,p){return s+p[0];},0)/r.length;cy=r.reduce(function(s,p){return s+p[1];},0)/r.length;}
-    else{cx=g.coordinates[0];cy=g.coordinates[1];}
-    var gcj=wgs84ToGcj02(cx,cy);
-    return{idx:i,wgsLon:cx,wgsLat:cy,gcjLon:gcj[0],gcjLat:gcj[1]};
-});
 
-function download(features,filename){
-    var blob=new Blob([JSON.stringify({type:\'FeatureCollection\',features:features})],{type:\'application/json\'});
-    var a=document.createElement(\'a\');a.href=URL.createObjectURL(blob);a.download=filename;a.click();
-    console.log(\'downloaded:\',filename,features.length+\'features\');
-}
+def wgs84_to_gcj02(lon, lat):
+    gx, gy = lon, lat
+    for _ in range(10):
+        wx, wy = gcj02_to_wgs84(gx, gy)
+        gx += lon - wx
+        gy += lat - wy
+    return gx, gy
 
-var ar=new AMap.ArrivalRange();
-var MINUTES=[30,45];
-var results30=[],results45=[];
-var done=0,ok=0,fail=0;
-var total=grids.length*MINUTES.length;
-var t0=Date.now();
-console.log(\'start\',grids.length,\'grids\',total,\'requests\');
 
-for(var i=0;i<grids.length;i++){
-    var g=grids[i];
-    for(var j=0;j<MINUTES.length;j++){
-        var min=MINUTES[j];
-        var res=await new Promise(function(resolve){
-            var _g=g,_m=min;
-            ar.search(new AMap.LngLat(_g.gcjLon,_g.gcjLat),_m,function(status,result){
-                if(result&&result.bounds&&result.bounds.length>0){
-                    var polys=result.bounds.map(function(poly){
-                        var ring=Array.isArray(poly[0])?poly:[poly];
-                        return ring[0].map(function(pt){return[pt[0],pt[1]];});
-                    });
-                    resolve({ok:true,polys:polys});
-                }else{resolve({ok:false,error:status});}
-            },{policy:\'BUS\'});
-        });
-        var feat={type:\'Feature\',geometry:{type:\'Point\',coordinates:[g.wgsLon,g.wgsLat]},properties:{grid_idx:g.idx,wgsLon:g.wgsLon,wgsLat:g.wgsLat,gcjLon:g.gcjLon,gcjLat:g.gcjLat,minute:min,status:res.ok?\'ok\':\'fail\',bounds:res.ok?res.polys:[]}};
-        if(min===30)results30.push(feat);else results45.push(feat);
-        if(res.ok)ok++;else fail++;
-        done++;
-        if(done%100===0||done===total){var e=((Date.now()-t0)/1000).toFixed(0);var eta=Math.round((total-done)*((Date.now()-t0)/1000)/done);console.log(\'progress:\'+done+\'/\'+total+\' ok:\'+ok+\' fail:\'+fail+\' elapsed:\'+e+\'s eta:\'+eta+\'s\');}
-        await new Promise(function(r){setTimeout(r,700);});
-    }
-    if(i>0&&i%300===0){
-        download(results30.slice(),\'iso30_partial_\'+i+\'.geojson\');
-        await new Promise(function(r){setTimeout(r,1000);});
-        download(results45.slice(),\'iso45_partial_\'+i+\'.geojson\');
-    }
-}
-console.log(\'DONE ok:\'+ok+\' fail:\'+fail);
-download(results30,\'isochrone_30min.geojson\');
-await new Promise(function(r){setTimeout(r,1500);});
-download(results45,\'isochrone_45min.geojson\');
-})();
-'''
+def make_config(grid_path, minutes=(45,), limit=None, interval_ms=700, timeout_ms=45000, max_attempts=3):
+    path = Path(grid_path)
+    data = json.loads(path.read_text(encoding='utf-8-sig'))
+    points, seen = [], set()
+    for index, feature in enumerate(data['features']):
+        properties = feature.get('properties', {})
+        center = shape(feature['geometry']).centroid
+        lon, lat = float(properties.get('cx', center.x)), float(properties.get('cy', center.y))
+        grid_id = hashlib.sha256(f'{lon:.8f},{lat:.8f}'.encode()).hexdigest()[:20]
+        if grid_id in seen:
+            continue
+        seen.add(grid_id)
+        gx, gy = wgs84_to_gcj02(lon, lat)
+        points.append({'grid_id': grid_id, 'grid_idx': index, 'wgs_lon': lon, 'wgs_lat': lat, 'gcj_lon': gx, 'gcj_lat': gy})
+        if limit is not None and len(points) >= limit:
+            break
+    if not points or any(t <= 0 for t in minutes) or (limit is not None and limit < 1):
+        raise ValueError('Nonempty grid, positive minutes and limit are required')
+    signature = hashlib.sha256(json.dumps({'points': points, 'minutes': list(minutes), 'policy': 'BUS', 'schema': 2}, sort_keys=True).encode()).hexdigest()[:20]
+    return {'collection_id': 'bus_' + signature, 'points': points, 'minutes': list(minutes), 'interval_ms': interval_ms, 'timeout_ms': timeout_ms, 'max_attempts': max_attempts, 'source_origin_count': len(data['features']), 'subset_only': limit is not None and len(points) < len(data['features'])}
 
-import subprocess
-subprocess.run(['pbcopy'], input=script.encode())
-print('已复制到剪贴板！大小:', len(script)//1024, 'KB')
-print('直接在高德demo控制台粘贴运行即可')
+
+def generate_script(config):
+    template = Path(__file__).with_name('arrival_range_collector.js').read_text(encoding='utf-8')
+    return template.replace('__ARRIVAL_CONFIG__', json.dumps(config, ensure_ascii=False))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    original_samples = ROOT / 'data/isochrone_45min_6districts.geojson'
+    parser.add_argument('--grid', type=Path, default=original_samples if original_samples.is_file() else ROOT / 'public/data/output/isochrone_grid_beijing.geojson')
+    parser.add_argument('--minutes', type=int, nargs='+', default=[45])
+    parser.add_argument('--limit', type=int)
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
+    config = make_config(args.grid, args.minutes, args.limit)
+    output = args.output or ROOT / 'data/isochrone_scripts' / (config['collection_id'] + '.js')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(generate_script(config), encoding='utf-8')
+    print(json.dumps({'script': str(output.resolve()), 'collection_id': config['collection_id'], 'origins': len(config['points']), 'requests': len(config['points']) * len(config['minutes']), 'policy': 'BUS', 'execution': 'Official AMap ArrivalRange demo console; stop/export via urbanArrivalCollector'}, ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()
