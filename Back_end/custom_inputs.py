@@ -185,11 +185,13 @@ def _read_layer(path, declaration, kind):
     return frame, {'declared': system, 'file_crs': stored, 'output_crs': 'EPSG:4326'}
 
 
-def _read_poi(path, declaration, city):
+def _read_poi(path, declaration, city, *, field_mapping=None, category_mapping=None):
     try:
         frame = pd.read_csv(path, encoding='utf-8-sig', dtype=str, keep_default_na=False)
     except (ValueError, UnicodeError) as error:
         raise ValueError('POI必须是带表头的UTF-8 CSV') from error
+    from .data_intake import map_fields, normalize_poi_fields
+    frame = map_fields(frame, 'poi', field_mapping)
     if {'name', 'type', 'location', 'cityname'}.issubset(frame.columns):
         _required(frame, ['id', 'name', 'type', 'location', 'cityname'], 'POI')
         if not frame.cityname.str.strip().str.removesuffix('市').eq(city['name'].strip().removesuffix('市')).all():
@@ -201,6 +203,7 @@ def _read_poi(path, declaration, city):
         categories = frame.type.str.split(';')
         frame['class_1'] = categories.str[0]
         frame['class_2'] = categories.map(lambda parts: parts[1] if len(parts)>1 else '')
+    frame = normalize_poi_fields(frame, category_mapping)
     _required(frame, ['id', 'name', 'class_1', 'lon', 'lat'], 'POI')
     if frame.empty or frame.id.duplicated().any():
         raise ValueError('POI不能为空且id必须唯一')
@@ -289,7 +292,7 @@ def _normalize_network(layers, city):
     return normalized
 
 
-def import_package(city, data, content_bytes, filename, coordinate_system):
+def import_package(city, data, content_bytes, filename, coordinate_system, *, field_mapping=None, category_mapping=None):
     """city must be an existing catalog record; data is the application's data root.
 
     Returns JSON-safe city + source_overrides. bus_dir is the network_root parent
@@ -303,6 +306,8 @@ def import_package(city, data, content_bytes, filename, coordinate_system):
     declarations = coordinate_system if isinstance(coordinate_system, dict) else {k: coordinate_system for k in ('stops','segments','routes','poi')}
     for kind in ('stops','segments','routes','poi'):
         _coordinate_spec(declarations.get(kind))
+    from .data_intake import inspect_package, map_fields
+    inspection = inspect_package(content_bytes, field_mapping=field_mapping, category_mapping=category_mapping, coordinate_system=coordinate_system)
     archive, infos = _members(content_bytes)
     version = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'_'+uuid4().hex[:8]
     root = Path(data).resolve()/'custom_inputs'/city_id/version
@@ -310,7 +315,9 @@ def import_package(city, data, content_bytes, filename, coordinate_system):
     manifest = {'schema': SCHEMA_VERSION, 'version': version, 'city_id': city_id,
                 'status': 'importing', 'filename': Path(str(filename)).name,
                 'source_sha256': hashlib.sha256(content_bytes).hexdigest(), 'source_files': {},
-                'source_crs': {}, 'output_crs': 'EPSG:4326'}
+                'source_crs': {}, 'output_crs': 'EPSG:4326',
+                'field_mapping': field_mapping or {}, 'category_mapping': category_mapping or {},
+                'quality': inspection['quality']}
     try:
         original.mkdir(parents=True, exist_ok=False)
         (original/'package.zip').write_bytes(content_bytes)
@@ -336,10 +343,11 @@ def import_package(city, data, content_bytes, filename, coordinate_system):
         layers = {}
         for kind in ('stops','segments','routes'):
             layers[kind], manifest['source_crs'][kind] = _read_layer(_find(extracted, kind), declarations[kind], kind)
+            layers[kind] = map_fields(layers[kind], kind, field_mapping)
         poi_paths = [p for p in extracted.rglob('*') if p.is_file() and p.name.lower() in ('poi.csv','pois.csv')]
         if len(poi_paths) != 1:
             raise ValueError('数据包必须包含唯一的poi.csv（或pois.csv）')
-        poi, manifest['source_crs']['poi'] = _read_poi(poi_paths[0], declarations['poi'], city)
+        poi, manifest['source_crs']['poi'] = _read_poi(poi_paths[0], declarations['poi'], city, field_mapping=field_mapping, category_mapping=category_mapping)
         network = _normalize_network(layers, city)
         bus_dir = root/'standardized'/'network_root'
         network_folder = bus_dir/city_id
@@ -371,7 +379,7 @@ def import_package(city, data, content_bytes, filename, coordinate_system):
         (root/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
         return {'version':version, 'city':updated_city, 'source_overrides':overrides,
                 'manifest':str(root/'manifest.json'), 'counts':manifest['counts'], 'warnings':warnings,
-                'prepared':False}
+                'prepared':False, 'quality': inspection['quality']}
     except Exception as error:
         manifest.update(status='failed', error=str(error))
         if root.is_dir():

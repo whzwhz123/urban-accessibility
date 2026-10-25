@@ -6,10 +6,13 @@ if __name__ == '__main__':
     sys.modules[f'{__package__}.local_api'] = sys.modules[__name__]
 
 import csv
+import io
 import json
 import re
 import os
 import shutil
+import math
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +30,7 @@ from .city_poi import cached_city_poi as _cached_poi, prepare_city_poi as _prepa
 from .city_network import cached_city_network as _cached_network, prepare_city_network as _prepare_network
 from .city_service import cached_city_service as _cached_service, import_city_service as _import_service
 from .city_evaluation import cached_city_evaluation, prepare_city_evaluation
-from .task_store import TaskStore, TaskCancelled, assignment_preflight
+from .task_store import TaskStore, TaskCancelled, assignment_preflight, check_cancel
 from .custom_inputs import source_directory_override, cached_custom_city_poi, prepare_custom_city_poi
 from .amap_sampling import collect_snapshot, sample_grid_pairs
 
@@ -52,7 +55,22 @@ PROVINCES = {
 def cached_city_network(city,bus_dir,output_root):
     return _cached_network(city,source_directory_override(city,bus_dir,POI)['bus_dir'],output_root)
 def prepare_city_network(city,bus_dir,output_root,progress=None):
-    return _prepare_network(city,source_directory_override(city,bus_dir,POI)['bus_dir'],output_root,progress)
+    directory=source_directory_override(city,bus_dir,POI)['bus_dir']
+    result=_prepare_network(city,directory,output_root,progress)
+    pending=city.get('pending_service_csv')
+    if pending:
+        from .task_store import write_json
+        source=(DATA/pending).resolve();source.relative_to(DATA.resolve())
+        marker=DATA/'custom_inputs'/city['id']/city['custom_input_version']/'project_service_restored.json'
+        applied=json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else {}
+        if applied.get('network_signature')!=result['signature']:
+            if progress:progress('恢复工程的分时发车数据')
+            provenance={'kind':'project_restore','pending_service_csv':pending,'original_service_manifest':city.get('pending_service_provenance')}
+            service=_import_service(city,directory,output_root,source.read_text(encoding='utf-8-sig'),provenance=provenance)
+            write_json(marker,{'network_signature':result['signature'],'upload_id':service['upload_id'],'source':pending})
+    return result
+
+
 def cached_city_poi(city,poi_dir,output_root):
     directory=source_directory_override(city,BUS,poi_dir)['poi_dir']
     return cached_custom_city_poi(city,directory,output_root) if city.get('poi_format')=='custom_standard_v1' else _cached_poi(city,directory,output_root)
@@ -68,10 +86,12 @@ BUILTIN_CITIES = {}
 
 
 def city_catalog():
-    with CITY_CODES.open(encoding='utf-8-sig', newline='') as stream:
-        names = {row['citycode']: row for row in csv.DictReader(stream)}
+    names = {}
+    if CITY_CODES.is_file():
+        with CITY_CODES.open(encoding='utf-8-sig', newline='') as stream:
+            names = {row['citycode']: row for row in csv.DictReader(stream)}
     cities = []
-    for folder in sorted(BUS.iterdir()):
+    for folder in sorted(BUS.iterdir()) if BUS.is_dir() else []:
         if not folder.is_dir():
             continue
         files = {}
@@ -104,6 +124,8 @@ def city_catalog():
             'poi_file': poi_file.name if poi_file else None,
             'has_evaluation': folder.name.casefold() == 'beijing',
         })
+    from .registered_cities import registered
+    cities.extend(city for city in registered(DATA) if city['id'] not in {row['id'] for row in cities})
     for city in cities:
         BUILTIN_CITIES[city['id']] = dict(city)
         pointer=DATA/'custom_inputs'/city['id']/'active.json'
@@ -136,28 +158,35 @@ ACTIVE_DEMANDS = {}
 ACTIVE_ASSIGNMENTS = {}
 ACTIVE_EVALUATIONS = {}
 ACTIVE_NAVIGATION = {}
+ACTIVE_BATCHES = {}
 POOL = ThreadPoolExecutor(max_workers=1)
 
 
 def run_input_job(job_id, city):
     job = JOBS[job_id]
-    job['status'] = 'running'
+    job.update(status='running')
 
+    def report(phase):
+        check_cancel(lambda:job.get('cancel_requested'))
+        job.update(phase=phase)
     try:
-        job['phase'] = '整理公交线网'
+        report('整理公交线网')
         network = prepare_city_network(
-            city, BUS, DATA / 'processed', progress=lambda phase: job.update(phase=phase)
+            city, BUS, DATA / 'processed', progress=report
         )
         job['phase'] = '筛选本市 POI'
 
         def progress(scanned, kept):
-            job['scanned_rows'] = scanned
-            job['poi_count'] = kept
+            check_cancel(lambda:job.get('cancel_requested'))
+            job.update(scanned_rows=scanned,poi_count=kept)
 
         poi = prepare_city_poi(city, POI, DATA / 'processed', progress=progress)
         city['network_prepared'] = True
         city['poi_prepared'] = True
+        check_cancel(lambda:job.get('cancel_requested'))
         job.update(status='completed', phase='完成', result={'network': network, 'poi': poi})
+    except TaskCancelled:
+        job.update(status='cancelled',phase='已停止，已准备数据保留')
     except Exception as error:
         job.update(status='failed', error=str(error))
     finally:
@@ -215,18 +244,34 @@ def run_opportunity_job(job_id, source, sigma):
 
 
 def run_shared_job(job_id,city,kind,options):
-    job=JOBS[job_id];job['status']='running'
+    job=JOBS[job_id];job.update(status='running')
+    def report(phase):
+        check_cancel(lambda:job.get('cancel_requested'))
+        job.update(phase=phase)
     try:
+        report('开始计算')
         if kind=='demand':
             from .city_demand import build
-            result=build(city,DATA,options,lambda phase:job.update(phase=phase))
+            result=build(city,DATA,options,report)
         else:
             from .city_workflow import compute
-            result=compute(city,DATA,options['demand_run_id'],options.get('parameters'),lambda phase:job.update(phase=phase),input_files=options.get('input_files'))
+            result=compute(city,DATA,options['demand_run_id'],options.get('parameters'),report,input_files=options.get('input_files'))
         job.update(status='completed',phase='完成',result=result)
+    except TaskCancelled:job.update(status='cancelled',phase='已停止；恢复将重做未完成计算，保留历史结果')
     except Exception as error:job.update(status='failed',error=str(error))
     finally:
         (ACTIVE_DEMANDS if kind=='demand' else ACTIVE_EVALUATIONS).pop(city['id'],None)
+
+
+def run_batch_job(job_id,city_id):
+    from .workflow_jobs import run_batch
+    from .batch_adapters import create_adapters
+    try:
+        run_batch(job_id,JOBS,lambda identity,**fields:JOBS[identity].update(**fields),create_adapters(BY_ID[city_id],DATA,BUS,POI))
+    except Exception as error:
+        JOBS[job_id].update(status='failed',phase='批任务未能启动',error=str(error))
+    finally:
+        ACTIVE_BATCHES.pop(city_id,None)
 
 
 def run_navigation_job(job_id, city_id, preview):
@@ -248,7 +293,7 @@ def run_navigation_job(job_id, city_id, preview):
 def city_runs(city_id):
     folder = DATA / 'runs' / city_id
     runs = []
-    for path in sorted(folder.glob('*/summary.json'), reverse=True)[:30]:
+    for path in sorted(folder.glob('*/summary.json'), reverse=True):
         from .run_history import recorded_run
         runs.append(recorded_run(path.parent))
     return runs
@@ -265,6 +310,9 @@ def run_flow(city_id, run_id):
         'served_flow_pax_per_hour', 'desired_vc', 'served_vc',
     ])
     features = []
+    def number(value):
+        value=float(value)
+        return value if math.isfinite(value) else None
     for row in frame.itertuples(index=False):
         if not row.geometry_wkt or pd.isna(row.geometry_wkt):
             continue
@@ -273,10 +321,10 @@ def run_flow(city_id, run_id):
             'properties': {
                 'edge_idx': int(row.edge_idx), 'from_name': str(row.from_name),
                 'to_name': str(row.to_name),
-                'capacity_pax_per_hour': float(row.capacity_pax_per_hour),
-                'desired_flow_pax_per_hour': max(0.0, float(row.desired_flow_pax_per_hour)),
-                'served_flow_pax_per_hour': max(0.0, float(row.served_flow_pax_per_hour)),
-                'desired_vc': max(0.0, float(row.desired_vc)), 'served_vc': max(0.0, float(row.served_vc)),
+                'capacity_pax_per_hour': number(row.capacity_pax_per_hour),
+                'desired_flow_pax_per_hour': number(row.desired_flow_pax_per_hour),
+                'served_flow_pax_per_hour': number(row.served_flow_pax_per_hour),
+                'desired_vc': number(row.desired_vc), 'served_vc': number(row.served_vc),
             },
         })
     return {'type': 'FeatureCollection', 'features': features}
@@ -325,12 +373,37 @@ def full_network_map(city_id, version):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        self.dispatch(self.get)
+
+    def do_POST(self):
+        self.dispatch(self.post)
+
+    def dispatch(self, action):
+        try:action()
+        except (BrokenPipeError,ConnectionResetError):pass
+        except (ValueError,KeyError,TypeError,UnicodeError,zipfile.BadZipFile) as error:
+            self.respond({'error':str(error)},400)
+        except FileNotFoundError:
+            self.respond({'error':'所需数据文件不存在，请补齐输入或重新准备城市数据'},404)
+        except Exception as error:
+            self.log_error('Request failed: %s',type(error).__name__)
+            self.respond({'error':'本地服务处理失败（'+type(error).__name__+'），请查看服务窗口'},500)
+
+    def get(self):
         path = urlparse(self.path).path
         if path == '/api/cities':
             self.respond({'cities': CITIES})
         elif path == '/api/jobs':
             city_id=parse_qs(urlparse(self.path).query).get('city_id',[None])[0]
             self.respond({'jobs':[job for job in JOBS.values() if city_id is None or job.get('city_id')==city_id]})
+        elif re.fullmatch(r'/api/cities/[^/]+/batches',path):
+            city_id=path.split('/')[3]
+            self.respond({'batches':sorted([job for job in JOBS.values() if job.get('city_id')==city_id and job.get('kind')=='batch'],key=lambda row:row.get('created_at',''),reverse=True)})
+        elif re.fullmatch(r'/api/cities/[^/]+/projects',path):
+            from .project_bundle import list_projects
+            city_id=path.split('/')[3]
+            if city_id not in BY_ID:self.respond({'error':'城市不存在'},404)
+            else:self.respond(list_projects(DATA,city_id))
         elif re.fullmatch(r'/api/cities/[^/]+/custom-inputs',path):
             from .input_versions import list_versions
             city_id=path.split('/')[3]
@@ -440,15 +513,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({'error': '综合评价结果不存在'}, 404)
             else:
                 self.respond(json.loads(file_path.read_text(encoding='utf-8')))
-        elif re.fullmatch(r'/api/cities/[^/]+/(runs|composite-runs)/[0-9]{8}_[0-9]{6}_[0-9a-f]{8}/export',path):
+        elif re.fullmatch(r'/api/cities/[^/]+/(runs|composite-runs)/[0-9]{8}_[0-9]{6}_[0-9a-f]{8}/(export|report)',path):
             from .artifact_exports import package
             city_id,kind,identity=path.split('/')[3:6]
             try:
                 if city_id not in BY_ID:raise ValueError('城市不存在')
-                file=package(DATA,city_id,identity,'assignment' if kind=='runs' else 'evaluation')
-                self.send_response(200);self.send_header('Content-Type','application/zip');self.send_header('Content-Disposition',f'attachment; filename="{city_id}_{identity}.zip"');self.send_header('Content-Length',str(file.stat().st_size));self.end_headers()
+                query=parse_qs(urlparse(self.path).query)
+                comparisons=tuple(filter(None,query.get('compare',[''])[0].split(',')))
+                model_kind='assignment' if kind=='runs' else 'evaluation'
+                if path.endswith('/report'):
+                    from .result_reports import generate_report
+                    file=generate_report(DATA,city_id,identity,model_kind,comparison_ids=comparisons)
+                    content_type='text/html; charset=utf-8'
+                else:
+                    format=query.get('format',['zip'])[0]
+                    file=package(DATA,city_id,identity,model_kind,format=format,include_report=query.get('report',['0'])[0]=='1',comparison_ids=comparisons)
+                    content_type='application/geopackage+sqlite3' if format=='gpkg' else 'application/zip'
+                self.send_response(200);self.send_header('Content-Type',content_type)
+                self.send_header('Content-Disposition',f'inline; filename="{city_id}_{identity}.html"' if path.endswith('/report') else f'attachment; filename="{city_id}_{identity}{file.suffix}"')
+                self.send_header('Content-Length',str(file.stat().st_size));self.end_headers()
                 with file.open('rb') as stream:shutil.copyfileobj(stream,self.wfile)
-            except ValueError as error:self.respond({'error':str(error)},400)
+            except (ValueError,FileNotFoundError,KeyError) as error:self.respond({'error':str(error)},400)
         elif re.fullmatch(r'/api/cities/[^/]+/preview', path):
             city_id = unquote(path[len('/api/cities/'):-len('/preview')]).strip('/')
             if city_id not in BY_ID:
@@ -511,7 +596,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({'error': '请先准备该城市的公交线网'}, 409)
             else:
                 template = DATA / 'processed' / city_id / 'network' / 'bus_headway_template.csv'
-                body = template.read_bytes()
+                with template.open(encoding='utf-8-sig',newline='') as stream:
+                    reader=csv.DictReader(stream);fields=list(reader.fieldnames or [])
+                    fields += [name for name in ('am_headway_min','pm_headway_min') if name not in fields]
+                    output=io.StringIO();writer=csv.DictWriter(output,fieldnames=fields);writer.writeheader()
+                    for row in reader:writer.writerow(row)
+                    body=('\ufeff'+output.getvalue()).encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/csv; charset=utf-8')
                 self.send_header('Content-Disposition', f'attachment; filename="{city_id}_bus_headways.csv"')
@@ -520,8 +610,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
         elif path.startswith('/api/cities/') and path.endswith('/runs'):
             city_id = unquote(path[len('/api/cities/'):-len('/runs')]).strip('/')
-            self.respond({'runs': city_runs(city_id), 'job': JOBS.get(ACTIVE_ASSIGNMENTS.get(city_id))} if city_id in BY_ID else {'error': '城市不存在'},
-                         200 if city_id in BY_ID else 404)
+            if city_id not in BY_ID:self.respond({'error':'城市不存在'},404);return
+            query=parse_qs(urlparse(self.path).query);offset=max(0,int(query.get('offset',['0'])[0]));limit=max(1,min(100,int(query.get('limit',['30'])[0])))
+            keyword=query.get('q',[''])[0].casefold();period=query.get('period',[''])[0]
+            history=[run for run in city_runs(city_id) if (not period or run.get('period')==period) and (not keyword or keyword in json.dumps(run,ensure_ascii=False).casefold())]
+            self.respond({'runs':history[offset:offset+limit],'total':len(history),'offset':offset,'has_more':offset+limit<len(history),'job':JOBS.get(ACTIVE_ASSIGNMENTS.get(city_id))})
+        elif re.fullmatch(r'/api/cities/[^/]+/runs/[0-9]{8}_[0-9]{6}_[0-9a-f]{8}/summary',path):
+            from .run_history import recorded_run
+            city_id,identity=path.split('/')[3],path.split('/')[5];folder=DATA/'runs'/city_id/identity
+            if city_id not in BY_ID or not (folder/'summary.json').is_file():self.respond({'error':'实验不存在'},404)
+            else:self.respond(recorded_run(folder))
+        elif re.fullmatch(r'/api/cities/[^/]+/runs/[0-9]{8}_[0-9]{6}_[0-9a-f]{8}/comparison',path):
+            from .run_history import recorded_run
+            city_id,identity=path.split('/')[3],path.split('/')[5];folder=DATA/'runs'/city_id/identity
+            if not (folder/'summary.json').is_file():self.respond({'error':'实验不存在'},404);return
+            reference=recorded_run(folder);mode=parse_qs(urlparse(self.path).query).get('mode',['strict'])[0]
+            from .assignment_comparison import matching_runs
+            self.respond({'runs':matching_runs(reference,city_runs(city_id),mode),'mode':mode})
         elif re.fullmatch(r'/api/cities/[^/]+/runs/[^/]+/flow-scale',path):
             import pandas as pd
             city_id,identity=path.split('/')[3],path.split('/')[5]
@@ -529,18 +634,18 @@ class Handler(BaseHTTPRequestHandler):
             base_file=DATA/'runs'/city_id/identity/'summary.json'
             if not base_file.is_file():self.respond({'error':'实验不存在'},404);return
             from .run_history import recorded_run
-            reference=recorded_run(base_file.parent);group=[]
-            keys=['demand_run_id','poi_count','hourly_demand_pax','default_headway_min','headway_upload_sha256','shared_demand_signature','algorithm']
-            for candidate in city_runs(city_id):
-                if all(candidate.get(k)==reference.get(k) for k in keys) and {k:v for k,v in candidate.get('parameters',{}).items() if k!='period'}=={k:v for k,v in reference.get('parameters',{}).items() if k!='period'}:group.append(candidate['run_id'])
+            reference=recorded_run(base_file.parent)
+            from .assignment_comparison import matching_runs
+            mode=parse_qs(urlparse(self.path).query).get('mode',['scenario'])[0]
+            group=[run['run_id'] for run in matching_runs(reference,city_runs(city_id),mode)]
             maxima={k:0. for k in ['desired_flow_pax_per_hour','served_flow_pax_per_hour','desired_vc','served_vc']}
             for run in group:
                 file=DATA/'runs'/city_id/run/'physical_segment_flows.csv'
                 if file.is_file():
                     frame=pd.read_csv(file,usecols=list(maxima))
-                    for k in maxima:maxima[k]=max(maxima[k],float(frame[k].max()))
+                    for k in maxima:maxima[k]=max(maxima[k],float(frame[k].max()) if frame[k].notna().any() else 0.)
             maxima['served_vc']=1.;maxima['desired_vc']=max(1.,maxima['desired_vc'])
-            self.respond({'maxima':maxima,'runs':group,'basis':'same city, shared demand, POI count, hourly demand, headway provenance and algorithm; period comparisons use common scale'})
+            self.respond({'maxima':maxima,'runs':group,'mode':mode,'basis':'同城市、共享需求版本、POI数量、模型参数和频率来源；scenario允许分时总需求不同，不能把差异归因于算法'})
         elif re.fullmatch(r'/api/cities/[^/]+/runs/[^/]+/flow', path):
             _, _, _, city_id, _, run_id, _ = path.split('/')
             if city_id not in BY_ID or not re.fullmatch(r'[0-9]{8}_[0-9]{6}_[0-9a-f]{8}', run_id):
@@ -589,20 +694,101 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.respond({'error': '接口不存在'}, 404)
 
-    def do_POST(self):
+    def post(self):
         path = urlparse(self.path).path
+        city_match=re.match(r'^/api/cities/([^/]+)/',path)
+        if city_match and ACTIVE_BATCHES.get(city_match.group(1)):
+            self.respond({'error':'本城市批量流程运行中，请先停止批次再修改输入或启动其他任务'},409);return
+        if path in ('/api/projects/export','/api/projects/import') or re.fullmatch(r'/api/projects/[0-9a-f]{32}/restore',path):
+            from .project_bundle import export_project,import_project,restore_project
+            try:
+                if path.endswith('/restore'):
+                    identity=path.split('/')[3]
+                    size=int(self.headers.get('Content-Length','0'))
+                    if size>10000:raise ValueError('恢复选项大小无效')
+                    options=json.loads(self.rfile.read(size)) if size else {}
+                    record_path=DATA/'projects'/identity/'project.json'
+                    saved=json.loads(record_path.read_text(encoding='utf-8'));city_id=saved['city']['id']
+                    if any(group.get(city_id) for group in (ACTIVE_ASSIGNMENTS,ACTIVE_BATCHES,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)):
+                        raise ValueError('本市任务运行中，请先结束后再恢复工程')
+                    result=restore_project(DATA,identity,restore_inputs=bool(options.get('restore_inputs')),original_city=BY_ID.get(city_id))
+                    if result.get('input_status')=='restored':
+                        city=result['city']
+                        if city_id in BY_ID:BY_ID[city_id].clear();BY_ID[city_id].update(city)
+                        else:
+                            from .registered_cities import registered
+                            original=next(row for row in registered(DATA) if row['id']==city_id)
+                            BUILTIN_CITIES[city_id]=original;BY_ID[city_id]=city;CITIES.append(city);CITIES.sort(key=lambda row:row['name'])
+                        city_preview.cache_clear();full_network_map.cache_clear()
+                    self.respond(result);return
+                size=int(self.headers.get('Content-Length','0'))
+                limit=2*1024**3 if path.endswith('/import') else 2_000_000
+                if not 0<size<=limit:raise ValueError('工程文件为空或超过大小限制')
+                raw=self.rfile.read(size)
+                if path.endswith('/import'):
+                    self.respond(import_project(DATA,raw),201);return
+                value=json.loads(raw)
+                city=BY_ID.get(value.get('city_id'))
+                if city is None:raise ValueError('城市不存在')
+                result=export_project(DATA,city,value.get('payload',{}),include_inputs=bool(value.get('include_inputs')),include_results=bool(value.get('include_results')))
+                self.send_response(200);self.send_header('Content-Type','application/zip');self.send_header('Content-Disposition',f'attachment; filename="{result["filename"]}"');self.send_header('Content-Length',str(len(result['content'])));self.end_headers();self.wfile.write(result['content'])
+            except (ValueError,KeyError,TypeError,FileNotFoundError) as error:self.respond({'error':str(error)},400)
+            return
+        if path=='/api/cities':
+            from .registered_cities import register
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 0<size<=10000:raise ValueError('城市信息大小无效')
+                city=register(DATA,json.loads(self.rfile.read(size)),BY_ID)
+                CITIES.append(city);CITIES.sort(key=lambda value:value['name']);BY_ID[city['id']]=city;BUILTIN_CITIES[city['id']]=dict(city)
+                self.respond({'city':city},201)
+            except (ValueError,TypeError) as error:self.respond({'error':str(error)},400)
+            return
         if re.fullmatch(r'/api/jobs/[0-9a-f]{32}/(cancel|resume)',path):
             identity,action=path.split('/')[3:5];job=JOBS.get(identity)
-            if not job or job.get('kind')!='assignment':self.respond({'error':'仅分配任务支持此控制'},400);return
+            if not job or job.get('kind') not in ('assignment','batch','demand','workflow','inputs'):
+                self.respond({'error':'此类任务尚不支持恢复控制'},400);return
             if action=='cancel':
-                job.update(cancel_requested=True);self.respond(job);return
+                if job.get('status') not in ('queued','running'):self.respond({'error':'任务没有运行'},400);return
+                job.update(cancel_requested=True,phase='请求停止，等待安全边界');self.respond(job);return
             if job.get('status') not in ('cancelled','interrupted','failed'):
                 self.respond({'error':'任务不是可恢复状态'},400);return
-            city_id=job['city_id']
-            if ACTIVE_ASSIGNMENTS.get(city_id):self.respond({'error':'本城市另有分配任务运行'},409);return
-            options={**job['options'],'resume_run_id':job.get('run_id')}
-            job.update(status='queued',phase='准备恢复',cancel_requested=False);ACTIVE_ASSIGNMENTS[city_id]=identity
-            POOL.submit(run_assignment_job,identity,city_id,options);self.respond(job,202);return
+            city_id=job['city_id'];kind=job['kind']
+            if kind in ('inputs','demand','workflow') and 'input_version' in job and job['input_version']!=BY_ID[city_id].get('custom_input_version'):
+                self.respond({'error':'城市输入版本已改变，请创建新任务，不能把旧任务恢复到新数据源'},409);return
+            registry={'assignment':ACTIVE_ASSIGNMENTS,'batch':ACTIVE_BATCHES,'demand':ACTIVE_DEMANDS,'workflow':ACTIVE_EVALUATIONS,'inputs':ACTIVE_JOBS}[kind]
+            if any(group.get(city_id) for group in (ACTIVE_ASSIGNMENTS,ACTIVE_BATCHES,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS,ACTIVE_JOBS)):
+                self.respond({'error':'本城市另有计算任务运行'},409);return
+            job.update(status='queued',phase='准备恢复',cancel_requested=False,error=None);registry[city_id]=identity
+            if kind=='assignment':POOL.submit(run_assignment_job,identity,city_id,{**job['options'],'resume_run_id':job.get('run_id')})
+            elif kind=='batch':POOL.submit(run_batch_job,identity,city_id)
+            elif kind=='inputs':POOL.submit(run_input_job,identity,BY_ID[city_id])
+            else:POOL.submit(run_shared_job,identity,BY_ID[city_id],kind,job['options'])
+            self.respond(job,202);return
+        if re.fullmatch(r'/api/cities/[^/]+/batches',path):
+            from .workflow_jobs import create_batch
+            from .city_workflow import normalize as normalize_workflow,sources
+            try:
+                city_id=path.split('/')[3];city=BY_ID[city_id]
+                if any(group.get(city_id) for group in (ACTIVE_ASSIGNMENTS,ACTIVE_BATCHES,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS,ACTIVE_JOBS)):raise ValueError('本城市已有计算任务，请等待或停止后再创建批次')
+                size=int(self.headers.get('Content-Length','0'))
+                if not 0<size<=2_000_000:raise ValueError('批配置大小无效')
+                options=json.loads(self.rfile.read(size))
+                options.setdefault('inputs',{})['custom_input_version']=city.get('custom_input_version')
+                from .assignment.parameters import normalize_parameters
+                from .city_demand import normalize as normalize_demand
+                assignment_options=options.setdefault('assignment',{})
+                assignment_options['parameters']=normalize_parameters(assignment_options.get('parameters'))
+                demand_options=options.setdefault('demand',{})
+                demand_options['parameters']=normalize_demand(city,demand_options.get('parameters'))
+                evaluation=options.setdefault('evaluation',{})
+                evaluation['parameters']=normalize_workflow(evaluation.get('parameters'))
+                chosen=sources(DATA,city_id,options.get('demand',{}).get('run_id'),evaluation['parameters']['isochrone']['max_time'],evaluation.get('input_files'))
+                evaluation['input_files']={key:file.name if file else None for key,file in chosen.items()}
+                job=create_batch(city_id,options);JOBS[job['id']]=job;ACTIVE_BATCHES[city_id]=job['id']
+                POOL.submit(run_batch_job,job['id'],city_id);self.respond(job,202)
+            except (ValueError,KeyError,TypeError) as error:self.respond({'error':str(error)},400)
+            return
         if re.fullmatch(r'/api/cities/[^/]+/assignment-preflight',path):
             try:
                 size=int(self.headers.get('Content-Length','0'));value=json.loads(self.rfile.read(size));parameters=__import__('Back_end.assignment.parameters',fromlist=['normalize_parameters']).normalize_parameters(value.get('parameters'))
@@ -621,7 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             city_id=path.split('/')[3]
             try:
                 if city_id not in BY_ID:raise ValueError('城市不存在')
-                if any(registry.get(city_id) for registry in (ACTIVE_ASSIGNMENTS,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)):raise ValueError('本市任务运行中，请结束后再切换数据源')
+                if any(registry.get(city_id) for registry in (ACTIVE_ASSIGNMENTS,ACTIVE_BATCHES,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)):raise ValueError('本市任务运行中，请结束后再切换数据源')
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=1000:raise ValueError('请求内容无效')
                 version=json.loads(self.rfile.read(size)).get('version')
@@ -632,15 +818,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({'city':city,'version':version,'message':'已切换输入版本；原始数据和所有实验均保留，请检查数据准备状态。'})
             except (ValueError,KeyError,json.JSONDecodeError) as error:self.respond({'error':str(error)},400)
             return
+        if re.fullmatch(r'/api/cities/[^/]+/(custom-inputs/inspect|timetable(/inspect)?)',path):
+            city_id=path.split('/')[3]
+            try:
+                if city_id not in BY_ID:raise ValueError('城市不存在')
+                query=parse_qs(urlparse(self.path).query)
+                size=int(self.headers.get('Content-Length','0'))
+                limit=100*1024*1024 if '/custom-inputs/' in path else 2_000_000
+                if not 0<size<=limit:raise ValueError('上传文件为空或超过大小限制')
+                content=self.rfile.read(size)
+                if '/custom-inputs/' in path:
+                    from .data_intake import inspect_package
+                    result=inspect_package(content,field_mapping=json.loads(query.get('field_mapping',['null'])[0]),category_mapping=json.loads(query.get('category_mapping',['null'])[0]),coordinate_system=query.get('coordinate_system',[None])[0])
+                else:
+                    from .timetable_import import parse_timetable_csv,import_timetable
+                    content=content.decode('utf-8-sig')
+                    options={'mode':query.get('mode',['auto'])[0],'day_type':query.get('day_type',['weekday'])[0]}
+                    if path.endswith('/inspect'):result=parse_timetable_csv(content,**options)
+                    else:
+                        if ACTIVE_ASSIGNMENTS.get(city_id) or globals().get('ACTIVE_BATCHES',{}).get(city_id):raise ValueError('请先结束本城市分配任务，再修改发车数据')
+                        directory=source_directory_override(BY_ID[city_id],BUS,POI)['bus_dir']
+                        result=import_timetable(BY_ID[city_id],directory,DATA/'processed',content,**options)
+                self.respond(result)
+            except (ValueError,KeyError,UnicodeError,TypeError) as error:self.respond({'error':str(error)},400)
+            return
         if re.fullmatch(r'/api/cities/[^/]+/custom-inputs',path):
             from .custom_inputs import import_package
             city_id=path.split('/')[3]
             try:
                 if city_id not in BY_ID:raise ValueError('城市不存在')
-                if any(registry.get(city_id) for registry in (ACTIVE_ASSIGNMENTS,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)):raise ValueError('本市任务运行中，请结束后再切换数据源')
+                if any(registry.get(city_id) for registry in (ACTIVE_ASSIGNMENTS,ACTIVE_BATCHES,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)):raise ValueError('本市任务运行中，请结束后再切换数据源')
                 size=int(self.headers.get('Content-Length','0'));query=parse_qs(urlparse(self.path).query)
                 if not 0<size<=100*1024*1024:raise ValueError('ZIP最大100MiB')
-                result=import_package(BY_ID[city_id],DATA,self.rfile.read(size),query.get('filename',['inputs.zip'])[0],query['coordinate_system'][0])
+                result=import_package(BY_ID[city_id],DATA,self.rfile.read(size),query.get('filename',['inputs.zip'])[0],query['coordinate_system'][0],field_mapping=json.loads(query.get('field_mapping',['null'])[0]),category_mapping=json.loads(query.get('category_mapping',['null'])[0]))
                 result['city']['has_evaluation']=False
                 result['city']['source_directory_override']={k:Path(v).resolve().relative_to(DATA.resolve()).as_posix() for k,v in result['source_overrides'].items()}
                 result['city']['custom_input_manifest']=Path(result['manifest']).resolve().relative_to(DATA.resolve()).as_posix()
@@ -718,7 +928,7 @@ class Handler(BaseHTTPRequestHandler):
                 registry=ACTIVE_DEMANDS if kind=='demand' else ACTIVE_EVALUATIONS
                 active=registry.get(city_id)
                 if active:self.respond(JOBS[active],202);return
-                identity=uuid4().hex;job={'id':identity,'city_id':city_id,'kind':kind,'status':'queued','phase':'等待计算','options':payload}
+                identity=uuid4().hex;job={'id':identity,'city_id':city_id,'kind':kind,'status':'queued','phase':'等待计算','options':payload,'input_version':city.get('custom_input_version')}
                 JOBS[identity]=job;registry[city_id]=identity
                 POOL.submit(run_shared_job,identity,city,kind,payload);self.respond(job,202)
             except (ValueError,TypeError,KeyError,json.JSONDecodeError) as error:self.respond({'error':str(error)},400)
@@ -883,7 +1093,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(JOBS[active], 202)
                 return
             job_id = uuid4().hex
-            job = {'id': job_id, 'city_id': city_id, 'status': 'queued',
+            job = {'id': job_id, 'city_id': city_id, 'kind':'inputs', 'options':{}, 'input_version':city.get('custom_input_version'), 'status': 'queued',
                    'scanned_rows': 0, 'poi_count': 0}
             JOBS[job_id] = job
             ACTIVE_JOBS[city_id] = job_id
@@ -891,7 +1101,12 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(job, 202)
 
     def respond(self, payload, status=200):
-        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        def serializable(value):
+            if isinstance(value,float) and not math.isfinite(value):return None
+            if isinstance(value,dict):return {key:serializable(item) for key,item in value.items()}
+            if isinstance(value,(list,tuple)):return [serializable(item) for item in value]
+            return value
+        body = json.dumps(serializable(payload), ensure_ascii=False,allow_nan=False).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))

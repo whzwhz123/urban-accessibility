@@ -1,3 +1,4 @@
+import ResultExports from './ResultExports';
 import React, { useEffect, useState } from 'react';
 import { Alert, Select } from 'antd';
 
@@ -79,6 +80,7 @@ const CompositePanel = ({ city, selectedRun, onRunChange, vis, onToggleVis, dema
                     <div style={{ color: '#ffca83' }}>不同城市或不同样本范围的独立归一化分数不能直接当作跨城市绝对排名。</div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}><a href={`/api/cities/${city.id}/composite-runs/${selectedRun.run_id}/export`} download>完整评价包</a><a href={`/api/cities/${city.id}/composite-runs/${selectedRun.run_id}/parameters`} download>参数快照</a></div>
                 </div>}
+                {selectedRun && <ResultExports city={city} runId={selectedRun.run_id} kind="evaluation" />}
                 {!selectedRun && <div style={{ marginTop: 8 }}>请先到分析设置计算本需求版本的评价。</div>}
                 {selectedRun?.pipeline === 'city_workflow_v1' && !selectedRun.weights && <div style={{ marginTop: 8 }}>已计算需求与覆盖度；综合评价需至少两个具有有效机会评分的格网。缺失指标没有补零。</div>}
                 {selectedRun?.weights && <div style={{ fontSize: 11, lineHeight: 1.8, marginTop: 9 }}>

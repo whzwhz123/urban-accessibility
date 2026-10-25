@@ -1,3 +1,5 @@
+import {ImageExportControls} from '../Sidebar/ResultExports';
+import {composeMapCanvas as captureMap} from '../../utils/mapExport';
 import React, { useMemo, useState, useEffect, useCallback, useRef } from 'react';
 import Map from 'react-map-gl';
 import MapLibreMap from 'react-map-gl/maplibre';
@@ -6,6 +8,7 @@ import DeckGL from '@deck.gl/react';
 import { GeoJsonLayer, PolygonLayer } from '@deck.gl/layers';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { compositeDisplay } from './compositeDisplay';
+import { gcjToWgs } from '../../utils/coordinates';
 
 const MAPBOX_TOKEN = process.env.REACT_APP_MAPBOX_TOKEN;
 const AMAP_KEY = process.env.REACT_APP_AMAP_KEY;
@@ -516,7 +519,7 @@ function TopRightControls({ city, demandRun, vis, onToggleVis, mapStyle, onStyle
 }
 
 // ── 搜索框 ────────────────────────────────────
-function SearchBox({ stopsData, onFlyTo, onHighlight }) {
+function SearchBox({ city, stopsData, onFlyTo, onHighlight }) {
     const [query, setQuery] = useState('');
     const [results, setResults] = useState([]);
     const [focused, setFocused] = useState(false);
@@ -529,11 +532,11 @@ function SearchBox({ stopsData, onFlyTo, onHighlight }) {
     const handleGeoSearch = async (q) => {
         if (!q.trim() || !AMAP_KEY) return;
         try {
-            const res = await fetch(`https://restapi.amap.com/v3/geocode/geo?address=${encodeURIComponent(q)}&city=北京&key=${AMAP_KEY}`);
+            const res = await fetch(`https://restapi.amap.com/v3/geocode/geo?address=${encodeURIComponent(q)}&city=${encodeURIComponent(/^\d{3,6}$/.test(city.city_code || '') ? city.city_code : city.name)}&key=${AMAP_KEY}`);
             const data = await res.json();
             if (data.status === '1' && data.geocodes?.length > 0) {
                 const [lon, lat] = data.geocodes[0].location.split(',').map(Number);
-                onFlyTo(lon, lat, 15); setResults([]);
+                const [wgsLon,wgsLat]=gcjToWgs(lon,lat); onFlyTo(wgsLon, wgsLat, 15); setResults([]);
             }
         } catch (e) { }
     };
@@ -691,6 +694,7 @@ function GridDetailPanel({ grid, onClose, tciSession, hasIsochrone, selectedZone
 
 // ══════════════════════════════════════════════
 const MapContainer = ({ data, vis, onToggleVis, tciSession, onSessionChange, compositeRun, demandRun, city = { id: 'Beijing', center: [116.4074, 39.920] } }) => {
+    const captureRoot=useRef(null);
     const [demandData, setDemandData] = useState(null);
     const [isochroneData, setIsochroneData] = useState(null);
     const [coverageData, setCoverageData] = useState(null);
@@ -1051,11 +1055,14 @@ const MapContainer = ({ data, vis, onToggleVis, tciSession, onSessionChange, com
     }, [data, stopsData, busLinesData, demandData, coverageData, isochroneData, tciData, vis, highlightStop, tciField, handleGridClick, loadIsoPolys, selectedIsoPoly, zoneIsoFeatures, selectedZone, compositeData, rawCompositeData, imbalanceOpacity, imbalanceRecordCounts, thematicOpacity]);
 
     return (
-        <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-            <DeckGL viewState={viewState} onViewStateChange={({ viewState: vs }) => setViewState(vs)} controller={true} layers={layers}>
-                {MAPBOX_TOKEN ? <Map {...viewState} mapboxAccessToken={MAPBOX_TOKEN} mapStyle={mapStyle} /> : <MapLibreMap {...viewState} mapStyle={OPEN_BASEMAP} />}
+        <div ref={captureRoot} style={{ position: 'relative', width: '100%', height: '100%' }}>
+            <DeckGL glOptions={{preserveDrawingBuffer:true}} viewState={viewState} onViewStateChange={({ viewState: vs }) => setViewState(vs)} controller={true} layers={layers}>
+                {MAPBOX_TOKEN ? <Map preserveDrawingBuffer {...viewState} mapboxAccessToken={MAPBOX_TOKEN} mapStyle={mapStyle} /> : <MapLibreMap preserveDrawingBuffer {...viewState} mapStyle={OPEN_BASEMAP} />}
             </DeckGL>
-            <SearchBox stopsData={stopsData} onFlyTo={handleFlyTo} onHighlight={setHighlightStop} />
+            <div style={{position:'absolute',right:16,bottom:170,padding:8,zIndex:120,borderRadius:7,background:'rgba(255,255,255,.94)',color:'#183c38',maxWidth:290,fontSize:11}}>
+                <ImageExportControls canvas={()=>captureMap(captureRoot.current)} metadata={{city:city.name,runId:compositeRun?.run_id || demandRun?.run_id,title:'城市公交评价地图',units:'见所选图层图例',legendLabel:Object.keys(vis || {}).filter(key=>vis[key]).join(' / '),coordinateSystem:'WGS84 / Web Mercator显示'}} />
+            </div>
+            <SearchBox city={city} stopsData={stopsData} onFlyTo={handleFlyTo} onHighlight={setHighlightStop} />
             {/* FIX 2: tciSession/onSessionChange props removed from TopRightControls */}
             <TopRightControls city={city} demandRun={demandRun} vis={vis} onToggleVis={onToggleVis} mapStyle={mapStyle} onStyleChange={setMapStyle} canSwitchStyle={!!MAPBOX_TOKEN} compositeRun={compositeRun} />
             <MapLegend thematicOpacity={thematicOpacity} onThematicOpacityChange={setThematicOpacity} vis={vis} tciSession={tciSession} imbalanceOpacity={imbalanceOpacity} onImbalanceOpacityChange={setImbalanceOpacity} reconstructed={!!compositeRun} isoMinutes={compositeRun?.workflow_parameters?.isochrone.max_time || 45} legacy={legacy} />

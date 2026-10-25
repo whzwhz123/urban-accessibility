@@ -1,3 +1,5 @@
+import BatchWorkflowPanel from './BatchWorkflowPanel';
+import ProjectPanel from './ProjectPanel';
 import React from 'react';
 import { Tabs } from 'antd';
 import DataUpload from './DataUpload';
@@ -6,32 +8,37 @@ import CompositePanel from './CompositePanel';
 import CityAssignmentPanel from './CityAssignmentPanel';
 import DemandPanel from './DemandPanel';
 
-const SidebarPanel = ({ city, onCityChange, onDataUpdate, geoData, vis, onToggleVis, tciSession, onSessionChange, selectedRun, onRunSelect, compositeRun, onCompositeRunChange, demandRun, onDemandChange, activeTab = '1', onTabChange, notice, onNoticeClose, drafts = {}, onDraftChange }) => {
+const SidebarPanel = ({ city, onCityChange, onDataUpdate, geoData, vis, onToggleVis, tciSession, onSessionChange, selectedRun, onRunSelect, compositeRun, onCompositeRunChange, demandRun, onDemandChange, activeTab = '1', onTabChange, notice, onNoticeClose, drafts = {}, onDraftChange, workspace, onRestoreProject, restoredConfig, onCompare, onConfigChange, onHistoricalView }) => {
     const activeKey = activeTab;
     const items = [
         {
             key: '1',
             label: '数据管理',
             children: (
+                <>
+                <ProjectPanel city={city} demandRun={demandRun} selectedRun={selectedRun} compositeRun={compositeRun} workspace={workspace} onRestore={onRestoreProject} />
                 <DataUpload
                     city={city}
                     onCityChange={onCityChange}
                     onDataUpdate={onDataUpdate}
                     geoData={geoData}
                 />
+                </>
             ),
         },
-        { key: 'demand', label: '需求配置', children: <DemandPanel city={city} demandRun={demandRun} onDemandChange={onDemandChange} onDirtyChange={dirty => onDraftChange('demand', dirty)} onToggleVis={onToggleVis} active={activeKey === 'demand'} /> },
+        { key: 'demand', label: '需求配置', children: <DemandPanel onConfigChange={value=>onConfigChange?.('demand_config',value)} restoredConfig={restoredConfig} city={city} demandRun={demandRun} onDemandChange={onDemandChange} onDirtyChange={dirty => onDraftChange('demand', dirty)} onToggleVis={onToggleVis} active={activeKey === 'demand'} /> },
         {
             key: 'assignment',
             label: '客流分配',
-            children: <CityAssignmentPanel demandRun={demandRun} city={city} selectedRun={selectedRun} onRunSelect={onRunSelect} onDemandChange={onDemandChange} active={activeKey === 'assignment'} />,
+            children: <><details style={{color:'#c8d7e4',padding:10}}><summary>批量运行多个时段 / 完整流程</summary><BatchWorkflowPanel assignmentScenario={workspace?.assignment_scenario} assignmentParameters={workspace?.assignment_parameters} analysisParameters={workspace?.analysis_parameters} city={city} demandRun={demandRun} onDemandChange={onDemandChange} onRunSelect={onRunSelect} onEvaluationComplete={onCompositeRunChange} /></details><CityAssignmentPanel onHistoricalView={onHistoricalView} onScenarioChange={value=>onConfigChange?.('assignment_scenario',value)} onConfigChange={value=>onConfigChange?.('assignment_parameters',value)} onCompare={onCompare} restoredConfig={restoredConfig} demandRun={demandRun} city={city} selectedRun={selectedRun} onRunSelect={onRunSelect} onDemandChange={onDemandChange} active={activeKey === 'assignment'} /></>,
         },
         {
             key: '2',
             label: '分析设置',
             children: (
                 <AnalysisPanel
+                    onConfigChange={value=>onConfigChange?.('analysis_parameters',value)}
+                    restoredConfig={restoredConfig}
                     city={city}
                     demandRun={demandRun}
                     selectedEvaluation={compositeRun}

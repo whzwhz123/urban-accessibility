@@ -6,7 +6,7 @@ import csv
 import json
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 from tempfile import TemporaryDirectory
 
@@ -48,6 +48,33 @@ def assignment_signature(city_id, cfg, headways_path, network, poi, shared=None,
     return content_signature({'city_id': city_id, 'parameters': asdict(cfg),
         'network': network, 'poi': poi, 'shared_demand': shared, 'source_bus': str(source_bus.resolve())}, files)
 
+
+def _checkpoint_location(output, metadata):
+    """Never follow a historical drive; migrated run-local checkpoints win."""
+    local = output / 'checkpoints'
+    if local.is_dir():
+        return local
+    stored = metadata.get('checkpoint_path', 'checkpoints')
+    path = Path(stored)
+    if path.is_absolute() or PureWindowsPath(stored).is_absolute():
+        raise ValueError('Legacy checkpoint must be migrated to the current run/checkpoints')
+    base = DATA if metadata.get('checkpoint_path_base') == 'data' else output
+    resolved = (base / path).resolve()
+    resolved.relative_to(base.resolve())
+    if not resolved.is_dir():
+        raise ValueError('Checkpoint directory is missing in the current project')
+    return resolved
+
+
+def _checkpoint_metadata(output, checkpoint_root):
+    path = checkpoint_root.resolve()
+    try:
+        return {'checkpoint_path': path.relative_to(output.resolve()).as_posix(), 'checkpoint_path_base': 'output'}
+    except ValueError:
+        try:
+            return {'checkpoint_path': path.relative_to(DATA.resolve()).as_posix(), 'checkpoint_path_base': 'data'}
+        except ValueError as error:
+            raise ValueError('Checkpoint directory must be inside DATA') from error
 
 def _cached_assignment(output, signature):
     summary_path = output / 'summary.json'
@@ -184,7 +211,8 @@ def run_city(city_id: str, period: str, poi_count: int, total_demand: float,
             return cached
         if (output / 'summary.json').exists():
             raise ValueError('Completed run artifacts changed; start a new run instead of overwriting history')
-        checkpoint_root = Path(checkpoint_dir) / city_id / run_id if checkpoint_dir else Path(metadata['checkpoint_path'])
+        checkpoint_root = Path(checkpoint_dir) / city_id / run_id if checkpoint_dir else _checkpoint_location(output, metadata)
+        _checkpoint_metadata(output, checkpoint_root)
     else:
         for previous in sorted(run_root.glob('*/summary.json'), reverse=True):
             cached = _cached_assignment(previous.parent, signature)
@@ -197,7 +225,7 @@ def run_city(city_id: str, period: str, poi_count: int, total_demand: float,
         output.mkdir(parents=True)
         checkpoint_root = Path(checkpoint_dir) / city_id / run_id if checkpoint_dir else output / 'checkpoints'
         write_json(output / 'run_state.json', {'run_id': run_id, 'signature': signature,
-            'checkpoint_path': str(checkpoint_root.resolve()), 'trusted_local_pickle_only': True,
+            **_checkpoint_metadata(output, checkpoint_root), 'trusted_local_pickle_only': True,
             'options': {'city_id': city_id, 'period': period, 'poi_count': poi_count, 'total_demand': total_demand,
                 'assumed_headway_min': assumed_headway_min, 'default_headway_min': default_headway_min,
                 'parameters': settings, 'demand_run_id': demand_run_id}})

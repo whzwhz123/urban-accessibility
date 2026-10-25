@@ -1,3 +1,4 @@
+import TaskControls from './TaskControls';
 import React, { useState, useRef, useEffect } from 'react';
 import AmapCollectionPanel from './AmapCollectionPanel';
 
@@ -121,7 +122,7 @@ const INITIAL = { coverage: { walk_full: 300, walk_zero: 800, walk_weight: 0.6, 
 const LAYERS = [{ key: 'coverage', label: '网络覆盖度' }, { key: 'isochrone', label: '机会可达性' }, { key: 'tci', label: '公交竞争力' }];
 import { readJson as read } from '../../utils/localApi';
 
-export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis, onToggleVis, tciSession, onSessionChange, onEvaluationComplete, onDirtyChange }) {
+export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis, onToggleVis, tciSession, onSessionChange, onEvaluationComplete, onDirtyChange, restoredConfig, onConfigChange, restoreKey }) {
   const [openKey, setOpenKey] = useState('coverage');
   const [params, setParams] = useState(INITIAL);
   const [inputs, setInputs] = useState({});
@@ -138,49 +139,64 @@ export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis
   const [taskHistory, setTaskHistory] = useState([]);
   const dirty = applied != null && JSON.stringify({ parameters: params, inputs }) !== JSON.stringify(applied);
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
-  const scope = useRef(null); scope.current = { city: city.id, demand: demandRun?.run_id };
-  const matches = own => scope.current.city === own.city && scope.current.demand === own.demand;
-  const collected = (kind, file) => { setInputs(old => ({ ...old, [kind]: file })); setInputRevision(old => old + 1); };
-  const collectingChanged = (kind, value) => setCollecting(old => old[kind] === value ? old : ({ ...old, [kind]: value }));
+  const scope = useRef(null);
+  const scopeKey = JSON.stringify([city.id, city.custom_input_version, demandRun?.run_id, restoreKey]);
+  if (scope.current?.key !== scopeKey || scope.current?.restore !== restoredConfig) scope.current = { key: scopeKey, restore: restoredConfig, city: city.id, demand: demandRun?.run_id };
+  const context = scope.current;
+  const matches = own => own === scope.current;
+  const [configOwner, setConfigOwner] = useState(null);
+  const latestEvaluation = useRef(selectedEvaluation); latestEvaluation.current = selectedEvaluation;
+  const latestForm = useRef(null); latestForm.current = { owner: configOwner, params, inputs };
+  const savedParameters = restoredConfig?.city_id === city.id ? restoredConfig.analysis_parameters || restoredConfig.evaluation_run?.workflow_parameters : null;
+  const collected = (kind, file) => { if (!matches(context)) return; setInputs(old => ({ ...old, [kind]: file })); setInputRevision(old => old + 1); };
+  const collectingChanged = (kind, value) => { if (matches(context)) setCollecting(old => old[kind] === value ? old : ({ ...old, [kind]: value })); };
   useEffect(() => {
     const controller = new AbortController();
+    const own = context;
     setMessage(''); setJob(null); setBusy(false); setInputs({}); setVersions({ isochrone: [], tci: [] }); setCollecting({}); setApplied(null);
     fetch(`/api/cities/${city.id}/workflow-settings?demand_run_id=${demandRun?.run_id || ''}`, { signal: controller.signal }).then(read).then(result => {
-      const settings = selectedEvaluation?.workflow_parameters || result.defaults;
-      setInputs(result.inputs); setJob(result.job); setParams(settings);
-      setApplied({ parameters: settings, inputs: result.inputs });
-    }).catch(e => { if (e.name !== 'AbortError') setMessage(e.message); });
+      if (controller.signal.aborted || !matches(own)) return;
+      const evaluation = latestEvaluation.current;
+      const form = latestForm.current;
+      const settings = form.owner === own ? form.params : savedParameters || (evaluation?.city_id === city.id ? evaluation.workflow_parameters : null) || result.defaults;
+      if (form.owner !== own) setInputs(result.inputs); setJob(result.job); setParams(settings); setConfigOwner(context);
+      setApplied({ parameters: settings, inputs: form.owner === own ? form.inputs : result.inputs });
+    }).catch(e => { if (!controller.signal.aborted && matches(own) && e.name !== 'AbortError') setMessage(e.message); });
     return () => controller.abort();
-  }, [city.id, demandRun?.run_id]);
+  }, [context]);
   useEffect(() => {
-    const controller = new AbortController(); setInputsLoading(true);
-    fetch(`/api/cities/${city.id}/workflow-settings?demand_run_id=${demandRun?.run_id || ''}&minutes=${params.isochrone.max_time}`, { signal: controller.signal }).then(read).then(result => {
+    const controller = new AbortController();
+    const own = context; setInputsLoading(true);
+    fetch(`/api/cities/${city.id}/workflow-settings?demand_run_id=${demandRun?.run_id || ''}&minutes=${params.isochrone?.max_time}`, { signal: controller.signal }).then(read).then(result => {
+      if (controller.signal.aborted || !matches(own)) return;
       setVersions(result.input_versions);
-      setInputs(old => Object.fromEntries(['isochrone', 'tci'].map(kind => [kind, result.input_versions[kind].some(row => row.file === old[kind]) ? old[kind] : result.inputs[kind]])));
+      setInputs(old => Object.fromEntries(['isochrone', 'tci'].map(kind => [kind, latestEvaluation.current?.city_id === city.id ? old[kind] ?? null : result.input_versions[kind].some(row => row.file === old[kind]) ? old[kind] : result.inputs[kind]])));
       setInputsLoading(false);
-    }).catch(error => { if (error.name !== 'AbortError') { setMessage(error.message); setInputsLoading(false); } });
+    }).catch(error => { if (!controller.signal.aborted && matches(own) && error.name !== 'AbortError') { setMessage(error.message); setInputsLoading(false); } });
     return () => controller.abort();
-  }, [city.id, demandRun?.run_id, params.isochrone.max_time, inputRevision]);
+  }, [context, params.isochrone?.max_time, inputRevision]);
   useEffect(() => {
-    if (selectedEvaluation?.workflow_parameters) {
-      const settings = { ...selectedEvaluation.workflow_parameters, isochrone: { ...selectedEvaluation.workflow_parameters.isochrone, method: selectedEvaluation.workflow_parameters.isochrone.method || 'legacy_distance' } };
-      setParams(settings);
+    if (selectedEvaluation?.city_id === city.id && selectedEvaluation?.workflow_parameters) {
+      const settings = selectedEvaluation.workflow_parameters;
+      setParams(settings); setConfigOwner(context);
       const files = Object.fromEntries(['isochrone','tci'].map(kind => [kind, selectedEvaluation.source_files?.[kind]?.split(/[\\/]/).pop() || null]));
       setInputs(files); setApplied({ parameters: settings, inputs: files });
     }
-  }, [selectedEvaluation?.run_id]);
+  }, [context, selectedEvaluation]);
   useEffect(() => {
-    if (!selectedEvaluation?.available_layers?.includes('tci')) { setTciData(null); return undefined; }
+    if (selectedEvaluation?.city_id !== city.id || !selectedEvaluation?.available_layers?.includes('tci')) { setTciData(null); return undefined; }
     const controller = new AbortController();
-    fetch(`/api/cities/${city.id}/composite-runs/${selectedEvaluation.run_id}/tci`, { signal: controller.signal }).then(read).then(setTciData).catch(() => {});
+    const own = context;
+    fetch(`/api/cities/${city.id}/composite-runs/${selectedEvaluation.run_id}/tci`, { signal: controller.signal }).then(read).then(value => { if (!controller.signal.aborted && matches(own)) setTciData(value); }).catch(() => {});
     return () => controller.abort();
-  }, [selectedEvaluation?.run_id]);
+  }, [context, selectedEvaluation]);
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return undefined;
-    const own = { ...scope.current };
+    const own = context;
+    let disposed = false;
     const timer = setInterval(async () => {
       try {
-        const next = await fetch(`/api/jobs/${job.id}`).then(read); if (!matches(own)) return; setJob(next);
+        const next = await fetch(`/api/jobs/${job.id}`).then(read); if (disposed || !matches(own)) return; setJob(next);
         if (next.status === 'completed') {
           if (next.result.city_id !== own.city || next.result.demand_run_id !== own.demand) { setMessage('其他需求版本的任务已完成，请为当前需求版本重新计算。'); return; }
           onEvaluationComplete(next.result);
@@ -189,34 +205,40 @@ export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis
         } else if (next.status === 'failed') setMessage(next.error);
       } catch (e) { if (matches(own)) setMessage(e.message); }
     }, 1500);
-    return () => clearInterval(timer);
-  }, [job?.id, job?.status]);
+    return () => { disposed = true; clearInterval(timer); };
+  }, [job?.id, job?.status, context]);
   useEffect(() => {
-    const controller = new AbortController(); setTaskHistory([]);
-    fetch(`/api/jobs?city_id=${city.id}`, { signal: controller.signal }).then(read).then(value => setTaskHistory(value.jobs.filter(row => row.kind === 'workflow' && row.options?.demand_run_id === demandRun?.run_id))).catch(error => { if (error.name !== 'AbortError') setMessage(error.message); });
+    const controller = new AbortController();
+    const own = context; setTaskHistory([]);
+    fetch(`/api/jobs?city_id=${city.id}`, { signal: controller.signal }).then(read).then(value => { if (!controller.signal.aborted && matches(own)) setTaskHistory(value.jobs.filter(row => row.kind === 'workflow' && row.options?.demand_run_id === demandRun?.run_id)); }).catch(error => { if (!controller.signal.aborted && matches(own) && error.name !== 'AbortError') setMessage(error.message); });
     return () => controller.abort();
-  }, [city.id, demandRun?.run_id, job?.status]);
+  }, [context, job?.status]);
   const retry = async row => {
-    const own = { ...scope.current };
+    const own = context;
     try {
       const next = await fetch(`/api/cities/${city.id}/workflows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(row.options) }).then(read);
       if (matches(own)) { setJob(next); setMessage('按原参数重新计算，历史结果不会覆盖。'); }
     } catch (error) { if (matches(own)) setMessage(error.message); }
   };
+  useEffect(() => {
+    if (savedParameters) { setParams(savedParameters); setConfigOwner(context); }
+  }, [context]);
+  useEffect(() => { if (configOwner === context) onConfigChange?.(params); }, [params, configOwner, context, onConfigChange]);
   const change = (group, key, value) => setParams(old => ({ ...old, [group]: { ...old[group], [key]: value } }));
   const run = async () => {
     if (!demandRun) { setMessage('请先生成共享需求版本'); return; }
     setMessage('');
-    const own = { ...scope.current };
+    const own = context;
     try { const next = await fetch(`/api/cities/${city.id}/workflows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ demand_run_id: demandRun.run_id, parameters: params, input_files: inputs }) }).then(read); if (matches(own)) setJob(next); }
     catch (e) { if (matches(own)) setMessage(e.message); }
   };
   const upload = async (event, kind) => {
     const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
-    const own = { ...scope.current };
+    const own = context;
     setBusy(true); setMessage('');
     try {
       let payload = JSON.parse(await file.text());
+      if (!matches(own)) return;
       const metadata = payload.metadata || {};
       if (metadata.city_id && metadata.city_id !== city.id) throw new Error('文件与当前城市不一致');
       if (metadata.demand_run_id && metadata.demand_run_id !== demandRun?.run_id) throw new Error('文件与当前需求版本不一致');
@@ -236,7 +258,7 @@ export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis
   const collectionRunning = Object.values(collecting).some(Boolean);
   const running = busy || evaluationRunning || collectionRunning || inputsLoading;
   const available = selectedEvaluation?.available_layers;
-  const validParameters = params.coverage.walk_full < params.coverage.walk_zero;
+  const validParameters = Object.entries(INITIAL).every(([group, values]) => Object.keys(values).every(key => params[group]?.[key] != null)) && params.coverage?.walk_full < params.coverage?.walk_zero;
   const restoreApplied = () => { if (applied) { setParams(applied.parameters); setInputs(applied.inputs); } };
   const values = tciData?.features.map(f => f.properties[`tci_${tciSession}`]).filter(v => typeof v === 'number') || [];
   return <div style={{ color: '#c8d7e4', fontSize: 12, padding: '8px 0' }}>
@@ -264,31 +286,31 @@ export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis
         </div>}
         {layer.key === 'coverage' && <>
           <SectionLabel>步行到站便捷度</SectionLabel>
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="满分距离" value={params.coverage.walk_full} min={0} max={1000} step={50} unit="米" onChange={v => change('coverage', 'walk_full', v)} />
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="零分距离" value={params.coverage.walk_zero} min={100} max={2000} step={50} unit="米" onChange={v => change('coverage', 'walk_zero', v)} />
-          <DualSlider disabled={evaluationRunning || collectionRunning} labelA="步行便捷度" labelB="线路多样性" valueA={params.coverage.walk_weight} onChange={v => change('coverage', 'walk_weight', v)} />
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="线路统计半径" value={params.coverage.diversity_r} min={100} max={2000} step={50} unit="米" onChange={v => change('coverage', 'diversity_r', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="满分距离" value={params.coverage?.walk_full} min={0} max={1000} step={50} unit="米" onChange={v => change('coverage', 'walk_full', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="零分距离" value={params.coverage?.walk_zero} min={100} max={2000} step={50} unit="米" onChange={v => change('coverage', 'walk_zero', v)} />
+          <DualSlider disabled={evaluationRunning || collectionRunning} labelA="步行便捷度" labelB="线路多样性" valueA={params.coverage?.walk_weight} onChange={v => change('coverage', 'walk_weight', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="线路统计半径" value={params.coverage?.diversity_r} min={100} max={2000} step={50} unit="米" onChange={v => change('coverage', 'diversity_r', v)} />
         </>}
         {layer.key === 'isochrone' && <>
           <SectionLabel>等时圈机会评分</SectionLabel>
-          <label>机会评分模型<select aria-label="机会评分模型" disabled={evaluationRunning || collectionRunning} style={{ ...CONTROL, width: '100%' }} value={params.isochrone.method || 'cumulative'} onChange={e => change('isochrone', 'method', e.target.value)}>
-            <option value="cumulative">累计机会：不估造出行时间</option><option value="time_bands">多时间档：衰减区间上下界</option><option value="legacy_distance">历史程序：距离近似时间</option>
+          <label>机会评分模型<select aria-label="机会评分模型" disabled={evaluationRunning || collectionRunning} style={{ ...CONTROL, width: '100%' }} value={params.isochrone?.method ?? ''} onChange={e => change('isochrone', 'method', e.target.value)}>
+            <option value="" disabled>未记录评分模型，请显式选择</option><option value="cumulative">累计机会：不估造出行时间</option><option value="time_bands">多时间档：衰减区间上下界</option><option value="legacy_distance">历史程序：距离近似时间</option>
           </select></label>
-          <p>{params.isochrone.method === 'time_bands' ? '采集15分钟步长的所有档位；结果为衰减评分上下界，不是精确OD耗时。' : params.isochrone.method === 'legacy_distance' ? '保留历史程序的距离比例近似；不是精确公交耗时，也不称为论文逐公式复现。' : '统计时间预算内可达POI的重要性总和；σ在此模式不参与计算。'}</p>
+          <p>{params.isochrone?.method === 'time_bands' ? '采集15分钟步长的所有档位；结果为衰减评分上下界，不是精确OD耗时。' : params.isochrone?.method == null ? '历史记录未提供评分模型，未使用当前默认值补齐。' : params.isochrone?.method === 'legacy_distance' ? '保留历史程序的距离比例近似；不是精确公交耗时，也不称为论文逐公式复现。' : '统计时间预算内可达POI的重要性总和；σ在此模式不参与计算。'}</p>
 
-          <SliderRow disabled={evaluationRunning || collectionRunning || params.isochrone.method === 'cumulative'} label="时间衰减带宽 σ" value={params.isochrone.sigma} min={1} max={60} unit="分钟" onChange={v => change('isochrone', 'sigma', v)} />
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="等时圈时间上限" value={params.isochrone.max_time} min={5} max={90} step={5} unit="分钟" onChange={v => change('isochrone', 'max_time', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning || params.isochrone?.method === 'cumulative'} label="时间衰减带宽 σ" value={params.isochrone?.sigma} min={1} max={60} unit="分钟" onChange={v => change('isochrone', 'sigma', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="等时圈时间上限" value={params.isochrone?.max_time} min={5} max={90} step={5} unit="分钟" onChange={v => change('isochrone', 'max_time', v)} />
           <p>上限改变时需采集对应时间的等时圈，不能把45分钟边界当作30分钟边界。</p>
-          <AmapCollectionPanel city={city} demandRun={demandRun} kind="isochrone" minutes={params.isochrone.max_time} method={params.isochrone.method || 'cumulative'} credentials={credentials} onBusyChange={collectingChanged} disabled={evaluationRunning || busy} onCollected={collected} onSessionChange={onSessionChange} />
+          <AmapCollectionPanel city={city} demandRun={demandRun} kind="isochrone" minutes={params.isochrone?.max_time} method={params.isochrone?.method} credentials={credentials} onBusyChange={collectingChanged} disabled={evaluationRunning || busy} onCollected={collected} onSessionChange={onSessionChange} />
           <label>导入原始等时圈<input aria-label="等时圈记录文件" type="file" accept=".json,.geojson" onChange={e => upload(e, 'isochrone')} disabled={running || !demandRun} /></label>
           <p>当前来源：{inputs.isochrone || '尚未采集本市等时圈'}。历史结果不会自动充当新城市的采集结果。</p>
         </>}
         {layer.key === 'tci' && <>
           <SectionLabel>导航竞争力参数</SectionLabel>
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="额外换乘惩罚 α" value={params.tci.alpha} min={0} max={30} unit="分钟/次" onChange={v => change('tci', 'alpha', v)} hint="导航耗时已含步行和候车；此处仅表示额外感知惩罚。" />
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="公交耗时上限" value={params.tci.bus_max} min={10} max={180} unit="分钟" onChange={v => change('tci', 'bus_max', v)} />
-          <SliderRow disabled={evaluationRunning || collectionRunning} label="驾车耗时上限" value={params.tci.car_max} min={5} max={120} unit="分钟" onChange={v => change('tci', 'car_max', v)} />
-          <AmapCollectionPanel city={city} demandRun={demandRun} kind="tci" minutes={params.isochrone.max_time} method={params.isochrone.method || 'cumulative'} credentials={credentials} onBusyChange={collectingChanged} disabled={evaluationRunning || busy} onCollected={collected} onSessionChange={onSessionChange} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="额外换乘惩罚 α" value={params.tci?.alpha} min={0} max={30} unit="分钟/次" onChange={v => change('tci', 'alpha', v)} hint="导航耗时已含步行和候车；此处仅表示额外感知惩罚。" />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="公交耗时上限" value={params.tci?.bus_max} min={10} max={180} unit="分钟" onChange={v => change('tci', 'bus_max', v)} />
+          <SliderRow disabled={evaluationRunning || collectionRunning} label="驾车耗时上限" value={params.tci?.car_max} min={5} max={120} unit="分钟" onChange={v => change('tci', 'car_max', v)} />
+          <AmapCollectionPanel city={city} demandRun={demandRun} kind="tci" minutes={params.isochrone?.max_time} method={params.isochrone?.method} credentials={credentials} onBusyChange={collectingChanged} disabled={evaluationRunning || busy} onCollected={collected} onSessionChange={onSessionChange} />
           <label>导入原始导航记录<input aria-label="导航记录文件" type="file" accept=".json" onChange={e => upload(e, 'tci')} disabled={running || !demandRun} /></label>
           <button onClick={template}>下载记录格式示例</button><p>示例数值仅用于说明格式，不能直接用于研究。当前来源：{inputs.tci || '缺少原始时间，无法重算历史聚合值'}。</p>
           <select aria-label="竞争力时段" style={CONTROL} value={tciSession} onChange={e => onSessionChange(e.target.value)}><option value="snapshot">实时采集快照</option><option value="morning">早高峰</option><option value="midday">平峰</option><option value="evening">晚高峰</option></select>
@@ -304,6 +326,7 @@ export default function AnalysisPanel({ city, demandRun, selectedEvaluation, vis
       {selectedEvaluation && <div style={{ marginTop: 8, display: 'flex', gap: 12 }}><a href={`/api/cities/${city.id}/composite-runs/${selectedEvaluation.run_id}/export`} download>完整评价包</a><a href={`/api/cities/${city.id}/composite-runs/${selectedEvaluation.run_id}/summary`} download>下载评价摘要</a><a href={`/api/cities/${city.id}/composite-runs/${selectedEvaluation.run_id}/parameters`} download>下载实际参数</a></div>}
       {!inputs.isochrone && <div style={{ color: '#ffca83', marginTop: 8 }}>缺少等时圈：可计算需求和覆盖度，暂不能生成机会评分、综合评价及供需分类。</div>}
       {!inputs.tci && <div style={{ color: '#9babb8', marginTop: 8 }}>缺少导航：公交竞争力暂不可用；不会将未采集值补为0。</div>}
+      <TaskControls key={scopeKey} job={job} onChange={value => { if (matches(context)) setJob(value); }} />
       {!!taskHistory.length && <details style={{ marginTop: 12 }}><summary>本需求版本的评价任务记录（{taskHistory.length}）</summary>
         {taskHistory.slice(-8).reverse().map(row => <div key={row.id} style={{ marginTop: 8, borderTop: '1px solid #ffffff18', paddingTop: 6 }}>
           {row.id.slice(0,8)} · {({ completed: '已完成', failed: '失败', interrupted: '已中断', queued: '排队中', running: '运行中' })[row.status] || row.status}

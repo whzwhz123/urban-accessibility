@@ -1,6 +1,7 @@
+import ResultExports from './ResultExports';
 import React, { useEffect, useState, useRef } from 'react';
 import { Alert, Button, InputNumber, Select } from 'antd';
-import { matchingPeriods, comparisonCsv } from './assignmentComparison';
+import { serverPeriodGroup, comparisonCsv } from './assignmentComparison';
 
 const PARAMETER_FIELDS = [
   { key: 'paths_per_transfer', label: 'K：每个换乘次数的候选路径数', value: 3, min: 1, integer: true },
@@ -27,10 +28,16 @@ const PERIODS = { am_peak: '早高峰', offpeak: '平峰', pm_peak: '晚高峰' 
 const STATUS = { pending: '等待中', queued: '排队中', running: '运行中', completed: '已完成', failed: '失败', interrupted: '中断', cancelled: '已停止' };
 const read = async response => { const value = await response.json(); if (!response.ok) throw new Error(value.error || '请求失败'); return value; };
 
-const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDemandChange, active, demandRun }) => {
+const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDemandChange, active, demandRun, restoredConfig, onCompare, onConfigChange, onScenarioChange, onHistoricalView, restoreKey }) => {
   const [inputs, setInputs] = useState(null);
   const [runs, setRuns] = useState([]);
   const [compareRunId, setCompareRunId] = useState(null);
+  const [comparisonMode,setComparisonMode]=useState('scenario');
+  const [historyQuery,setHistoryQuery]=useState('');
+  const [appliedQuery,setAppliedQuery]=useState('');
+  const [hasMore,setHasMore]=useState(false);
+  const [historyTotal,setHistoryTotal]=useState(0);
+  const [historyBusy,setHistoryBusy]=useState(false);
   const [job, setJob] = useState(null);
   const [error, setError] = useState('');
   const [period, setPeriod] = useState('pm_peak');
@@ -45,23 +52,32 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
   const [notice, setNotice] = useState('');
   const [controlBusy, setControlBusy] = useState(false);
   const pendingMap = useRef(null);
-  const selectedRun = inspectedRun || (externalRun?.city_id === city.id ? externalRun : null);
+  const detailRequest = useRef(0);
+  const configScope = useRef(null);
+  const configKey = JSON.stringify([city.id, city.custom_input_version, restoreKey]);
+  if (configScope.current?.key !== configKey || configScope.current?.restore !== restoredConfig) configScope.current = { key: configKey, restore: restoredConfig };
+  const configContext = configScope.current;
+  const [configOwner, setConfigOwner] = useState(null);
+  const savedScenario = restoredConfig?.city_id === city.id ? restoredConfig.assignment_scenario : null;
+  const scenarioDemand = useRef(null);
+  const selectedRun = (inspectedRun?.city_id === city.id ? inspectedRun : null) || (externalRun?.city_id === city.id ? externalRun : null);
   const reusedDemand = useRef(null);
   const scope = useRef(null);
-  const scopeKey = JSON.stringify([city.id, city.custom_input_version, demandRun?.run_id]);
-  if (scope.current?.key !== scopeKey) scope.current = { key: scopeKey };
+  const scopeKey = JSON.stringify([city.id, city.custom_input_version, demandRun?.run_id, restoreKey]);
+  if (scope.current?.key !== scopeKey || scope.current?.config !== configContext) scope.current = { key: scopeKey, config: configContext };
+  const context = scope.current;
   const matches = own => own === scope.current;
 
   useEffect(() => {
     setInspectedRun(null); setCompareRunId(null); setPreflight(null); setPreflightBusy(false);
-    setControlBusy(false); setNotice(''); setError(''); setTaskHistory([]);
+    setControlBusy(false); setHistoryBusy(false); setNotice(''); setError(''); setTaskHistory([]);
     const pending = pendingMap.current;
     pendingMap.current = null;
     if (pending?.city_id === city.id && pending.demand_run_id === demandRun?.run_id) {
       setInspectedRun(pending); onRunSelect(pending);
       setNotice('已切换到历史需求版本，并显示该实验客流图。');
     }
-  }, [scopeKey]);
+  }, [context]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -69,21 +85,21 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
     setInputs(null);
     setRuns([]);
     setCompareRunId(null);
-    setJob(null);
+    setJob(null); setHistoryBusy(false);
     setError('');
     Promise.all([
       fetch(`/api/cities/${encodeURIComponent(city.id)}/inputs`, { signal: controller.signal }).then(read),
-      fetch(`/api/cities/${encodeURIComponent(city.id)}/runs`, { signal: controller.signal }).then(read),
+      fetch(`/api/cities/${encodeURIComponent(city.id)}/runs?q=${encodeURIComponent(appliedQuery)}`, { signal: controller.signal }).then(read),
     ]).then(([prepared, history]) => {
       if (controller.signal.aborted || !matches(own)) return;
       setInputs(prepared);
-      setRuns(history.runs || []);
+      setRuns(history.runs || []); setHasMore(!!history.has_more); setHistoryTotal(history.total ?? history.runs?.length ?? 0);
       setJob(history.job || null);
       if (history.job && ['queued', 'running'].includes(history.job.status) && history.job.options?.demand_run_id !== demandRun?.run_id) setNotice('本市既有分配任务使用不同的需求版本；不会将其结果加载到当前需求，可在任务历史查看或停止。');
 
     }).catch(e => { if (!controller.signal.aborted && matches(own) && e.name !== 'AbortError') setError(e.message || '无法读取城市数据或实验记录'); });
     return () => controller.abort();
-  }, [scopeKey, active]);
+  }, [context, active, appliedQuery]);
 
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return undefined;
@@ -97,7 +113,7 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
           setJob(next);
           setTaskHistory(previous => [next, ...previous.filter(row => row.id !== next.id)]);
           if (next.status === 'completed' && next.result) {
-            if (!next.result.demand_run_id || next.result.demand_run_id === demandRun?.run_id) { setInspectedRun(null); onRunSelect(next.result); }
+            if (next.result.city_id === city.id && next.result.demand_run_id && next.result.demand_run_id === demandRun?.run_id) { setInspectedRun(null); onRunSelect(next.result); }
             else setNotice('任务已完成，但需求版本不同；请在任务历史中查看结果。');
             setRuns(previous => [next.result, ...previous.filter(run => run.run_id !== next.result.run_id)]);
           }
@@ -106,14 +122,17 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
         .catch(() => { if (!disposed && matches(own)) setError('无法读取实验进度'); });
     }, 1500);
     return () => { disposed = true; clearInterval(timer); };
-  }, [job?.id, job?.status, scopeKey]);
+  }, [job?.id, job?.status, context]);
 
   useEffect(() => {
     const key = `${demandRun?.run_id}:${period}`;
-    const value = reusedDemand.current?.key === key ? reusedDemand.current.value : demandRun?.parameters?.hourly_demands?.[period];
+    const restored = scenarioDemand.current;
+    const preserve = restored?.context === configContext && restored.period === period && (!restored.demandId || restored.demandId === demandRun?.run_id);
+    const value = preserve ? restored.value : reusedDemand.current?.key === key ? reusedDemand.current.value : demandRun?.parameters?.hourly_demands?.[period];
+    if (preserve && demandRun) restored.demandId = demandRun.run_id;
     reusedDemand.current = null;
     if (demandRun) setDemand(value ?? null);
-  }, [demandRun?.run_id, period]);
+  }, [demandRun?.run_id, period, configContext]);
   useEffect(() => {
     const own = scope.current;
     let disposed = false;
@@ -123,7 +142,7 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
     refresh();
     const timer = setInterval(refresh, 3000);
     return () => { disposed = true; clearInterval(timer); };
-  }, [scopeKey, job?.status, active]);
+  }, [context, job?.status, active]);
   const checkScale = async () => {
     const own = scope.current;
     setPreflightBusy(true); setError('');
@@ -145,23 +164,35 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
     } catch (error) { if (matches(own)) setError(error.message); }
     finally { if (matches(own)) setControlBusy(false); }
   };
-  const viewRun = run => {
+  const viewRun = async run => {
     if (!run) { setError('任务未记录可查看的结果，请检查已有实验列表。'); return; }
-    setInspectedRun(run); setError('');
-    if (run.demand_run_id && run.demand_run_id !== demandRun?.run_id) {
-      onRunSelect(null);
-      setNotice('已打开历史实验详情。需求版本与当前不同，未替换当前需求，也未加载客流图。');
-    } else {
-      onRunSelect(run); setNotice('已选择实验：' + run.run_id + '，下方显示历史参数与结果。');
-    }
+    const own = scope.current;
+    const request = ++detailRequest.current;
+    onRunSelect(null); setError('');
+    try {
+      const detail = await fetch('/api/cities/' + encodeURIComponent(city.id) + '/runs/' + encodeURIComponent(run.run_id) + '/summary').then(read);
+      if (!matches(own) || request !== detailRequest.current) return;
+      if (detail.city_id !== city.id) throw new Error('实验与当前城市不一致');
+      setInspectedRun(detail);
+      setNotice('已打开完整历史详情，未修改当前需求草稿。请显式选择只读查看，或加载对应有效需求后显示客流图。新计算仍使用当前共享需求。');
+    } catch (error) { if (matches(own) && request === detailRequest.current) setError('无法读取历史详情：' + error.message); }
   };
   const switchHistoricalDemand = async () => {
     const own = scope.current;
+    const run = selectedRun;
+    const request = detailRequest.current;
     try {
-      const summary = await fetch(`/api/cities/${encodeURIComponent(city.id)}/demand-runs/${encodeURIComponent(selectedRun.demand_run_id)}/summary`).then(read);
+      const summary = await fetch(`/api/cities/${encodeURIComponent(city.id)}/demand-runs/${encodeURIComponent(run.demand_run_id)}/summary`).then(read);
       if (!matches(own)) return;
-      pendingMap.current = selectedRun;
-      onDemandChange(summary);
+      if (request !== detailRequest.current) return;
+      const history = await fetch('/api/cities/' + encodeURIComponent(city.id) + '/demand-runs').then(read);
+      if (!matches(own) || request !== detailRequest.current) return;
+      const effective = history.runs?.find(row => row.run_id === summary.run_id && row.current_inputs !== false);
+      if (!effective || summary.current_inputs === false) throw new Error('历史需求对应旧输入或版本不可用，不能作为当前共享需求；请使用历史只读查看');
+      if (summary.city_id !== city.id || summary.run_id !== run.demand_run_id) throw new Error('历史需求版本与实验不一致');
+      if (demandRun?.run_id === summary.run_id) { onRunSelect(run); setNotice('已加载对应有效需求并显示客流图；当前需求草稿未修改。'); return; }
+      pendingMap.current = run;
+      onDemandChange(effective);
       setNotice('正在切换历史需求版本…');
     } catch (error) { if (matches(own)) setError('无法切换历史需求：' + error.message); }
   };
@@ -191,7 +222,7 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
     }
   };
 
-  const ready = !!inputs?.network && !!inputs?.poi && !!demandRun;
+  const ready = !!inputs?.network && !!inputs?.poi && !!demandRun && demandRun.current_inputs !== false && demandRun.city_id === city.id;
   const running = [job, ...taskHistory].some(row => ['queued', 'running'].includes(row?.status));
   const parametersValid = PARAMETER_FIELDS.every(field => {
     const value = parameters[field.key];
@@ -207,7 +238,37 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
 
     setHeadway(selectedRun.default_headway_min ?? selectedRun.assumed_headway_min ?? null);
   };
-  const periodGroup = matchingPeriods(selectedRun, runs);
+  const [comparisonRuns, setComparisonRuns] = useState(null);
+  const comparisonRequest = useRef(null);
+  const comparisonKey = JSON.stringify([scopeKey, selectedRun?.run_id, comparisonMode]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const own = context;
+    setComparisonRuns(null);
+    if (!selectedRun?.run_id) return () => controller.abort();
+    fetch('/api/cities/' + encodeURIComponent(city.id) + '/runs/' + encodeURIComponent(selectedRun.run_id) + '/comparison?mode=' + comparisonMode, { signal: controller.signal })
+      .then(read).then(value => { if (!controller.signal.aborted && matches(own)) setComparisonRuns({ key: comparisonKey, runs: value.runs || [] }); })
+      .catch(error => { if (!controller.signal.aborted && matches(own)) { setComparisonRuns(null); setError('无法读取完整历史分时对照：' + error.message); } });
+    return () => controller.abort();
+  }, [context, selectedRun?.run_id, comparisonMode]);
+  useEffect(() => {
+    const saved = restoredConfig?.city_id === city.id ? restoredConfig : null;
+    setParameters(saved?.assignment_parameters ? Object.fromEntries(PARAMETER_FIELDS.map(field => [field.key, saved.assignment_parameters[field.key] ?? null])) : { ...DEFAULT_PARAMETERS });
+    const scenario = saved?.assignment_scenario;
+    setPeriod(scenario ? scenario.period ?? null : saved?.assignment_run?.period ?? 'pm_peak');
+    setPoiCount(scenario ? scenario.poi_count ?? null : 500);
+    setDemand(scenario ? scenario.total_demand ?? null : demandRun ? demandRun.parameters?.hourly_demands?.pm_peak ?? null : 100000);
+    setHeadway(scenario ? scenario.default_headway_min ?? null : 15);
+    scenarioDemand.current = scenario ? { context: configContext, period: scenario.period, value: scenario.total_demand ?? null, demandId: demandRun?.run_id } : null;
+    setConfigOwner(configContext);
+  }, [configContext]);
+  useEffect(() => { if (configOwner === configContext) onConfigChange?.(parameters); }, [parameters, configOwner, configContext, onConfigChange]);
+  useEffect(() => {
+    if (configOwner === configContext) onScenarioChange?.({ period, poi_count: poiCount, total_demand: demand, default_headway_min: headway });
+  }, [period, poiCount, demand, headway, configOwner, configContext, onScenarioChange]);
+  const periodGroup = comparisonRuns?.key === comparisonKey ? serverPeriodGroup(selectedRun, comparisonRuns.runs) : {};
+  const latestQuery = useRef(appliedQuery); latestQuery.current = appliedQuery;
+  const loadMore=async()=>{const query=appliedQuery;const own=scope.current;setHistoryBusy(true);try{const value=await fetch(`/api/cities/${city.id}/runs?q=${encodeURIComponent(appliedQuery)}&offset=${runs.length}`).then(read);if(matches(own) && latestQuery.current === query){setRuns(previous=>[...previous,...value.runs.filter(row=>!previous.some(old=>old.run_id===row.run_id))]);setHasMore(value.has_more);setHistoryTotal(value.total);}}catch(error){if(matches(own))setError(error.message);}finally{if(matches(own) && latestQuery.current === query)setHistoryBusy(false);}};
   const exportPeriods = () => {
     const url = URL.createObjectURL(new Blob([comparisonCsv(periodGroup)], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a'); link.href = url; link.download = `${city.id}_${selectedRun.run_id}_period_comparison.csv`; link.click(); URL.revokeObjectURL(url);
@@ -283,11 +344,11 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
       <div style={label}>缺失线路默认发车间隔（分钟）</div>
       <InputNumber aria-label="缺失线路默认发车间隔（分钟）" style={field} min={0.1} value={headway} onChange={setHeadway} disabled={running} />
       <div style={{ color: '#ffca83', fontSize: 11, marginTop: 5 }}>上传值优先，仅缺失线路使用此缺省值。默认15分钟相当于4班/小时；这部分是情景假设，不是实测。</div>
-      <div style={{ marginTop: 6, fontSize: 11 }}>已上传：{period === 'offpeak' ? inputs?.service?.flat_headway_routes || 0 : inputs?.service?.peak_headway_routes || 0} 个线路方向。<a href={`/api/cities/${city.id}/headway-template`} download>下载模板</a>；在“数据管理”上传。</div>
+      <div style={{ marginTop: 6, fontSize: 11 }}>已上传：{inputs?.service?.[({ am_peak: 'am_headway_routes', pm_peak: 'pm_headway_routes', offpeak: 'flat_headway_routes' })[period]] ?? inputs?.service?.peak_headway_routes ?? 0} 个线路方向。<a href={`/api/cities/${city.id}/headway-template`} download>下载模板</a>；在“数据管理”上传。</div>
       <Button size="small" onClick={checkScale} loading={preflightBusy} disabled={!ready || running || !parametersValid}>检查计算规模</Button>
       {preflight && <div style={{ fontSize: 11, lineHeight: 1.7, marginTop: 7 }}>理论OD上界 {preflight.upper_bounds.ordered_od_pairs.toLocaleString()}；路径上界 {preflight.upper_bounds.candidate_paths.toLocaleString()}；仅流量向量上界 {(preflight.upper_bounds.path_flow_float64_bytes / 1024 ** 2).toFixed(1)} MiB。这是筛选前上界，不是实际内存或耗时预测；生成路径后会记录实测规模。</div>}
       {preflight?.historical_references?.length > 0 && <div style={{ fontSize: 11, marginTop: 6 }}>历史实测参考（不保证本次耗时）：{preflight.historical_references.map(reference => `${reference.poi_count} POI约${reference.total_seconds.toFixed(1)}秒`).join('；')}。参数、版本和缓存状态可能不同，未对全城规模作未经验证的外推。</div>}
-      <Button type="primary" block style={{ marginTop: 15 }} loading={running} disabled={!parametersValid || !ready || !poiCount || !demand || !headway} onClick={start}>
+      <Button type="primary" block style={{ marginTop: 15 }} loading={running} disabled={!parametersValid || !ready || !PERIODS[period] || !poiCount || !demand || !headway} onClick={start}>
         {running ? '正在计算' : '开始交通分配'}
       </Button>
       {job && ['queued', 'running'].includes(job.status) && <Button size="small" danger disabled={controlBusy || job.cancel_requested} style={{ marginTop: 8 }} onClick={() => control(job.id, 'cancel')}>停止并保存断点</Button>}
@@ -311,15 +372,18 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
         {row.status === 'completed' && <Button size="small" onClick={() => viewRun(runs.find(run => run.run_id === (row.result?.run_id || row.run_id)) || row.result)}>查看任务结果</Button>}
       </div>)}
       <div style={{ ...label, marginTop: 22 }}>已有实验</div>
+      <div style={{display:'flex',gap:5,marginBottom:7}}><input aria-label="检索历史实验" placeholder="编号、时段、需求或POI数量" value={historyQuery} onChange={event=>setHistoryQuery(event.target.value)} style={{minWidth:0,width:'100%'}}/><Button size="small" onClick={()=>setAppliedQuery(historyQuery)}>检索</Button></div>
+      <div style={{fontSize:11}}>已显示{runs.length} / {historyTotal}组；历史文件不会因分页删除。</div>
       {runs.length ? (
         <Select style={field} value={selectedRun?.run_id} aria-label="已有实验" onChange={id => viewRun(runs.find(run => run.run_id === id))}
           options={runs.map(run => ({ value: run.run_id, label: `${PERIODS[run.period] || '未记录'} · ${run.poi_count} POI · ${run.source_experiment || run.run_id.slice(0, 15)}` }))} />
       ) : <div style={{ fontSize: 11, color: '#9babb8' }}>暂无分配结果</div>}
+      {hasMore && <Button size="small" loading={historyBusy} onClick={loadMore}>加载更多历史实验</Button>}
       {selectedRun?.city_id === city.id && <div style={{ fontSize: 11, lineHeight: 1.8, marginTop: 10 }}>
-        {selectedRun.demand_run_id && selectedRun.demand_run_id !== demandRun?.run_id && <>
-          <Alert type="warning" message="此历史实验与当前共享需求版本不同：可查看完整记录，客流图需切换到历史需求版本后显示。" />
-          {onDemandChange ? <Button size="small" onClick={switchHistoricalDemand}>切换历史需求并显示客流图</Button> : <div>请在需求配置中选择版本 {selectedRun.demand_run_id} 后，再选择本实验查看客流图。</div>}
-        </>}
+        <Alert type="warning" message="历史详情不会覆盖当前需求草稿。只读查看不切换共享需求、不发起计算；新计算仍使用当前共享需求。切换历史需求将替换需求表单，请先保存草稿。" />
+        {onHistoricalView && <Button size="small" onClick={() => { onHistoricalView(selectedRun); setNotice('历史只读查看：未切换当前共享需求，未修改需求草稿。新计算仍使用当前共享需求。'); }}>只读查看历史客流图（不切换当前需求）</Button>}
+        {selectedRun.demand_run_id && onDemandChange && <Button size="small" onClick={switchHistoricalDemand}>加载对应有效需求并显示客流图</Button>}
+        {!selectedRun.demand_run_id && <div>未记录对应需求版本；仅支持历史只读查看，不用于新计算。</div>}
         {selectedRun.poi_coordinate_system !== 'WGS84' && <Alert type="warning" message="历史实验未记录坐标转换来源；当前按原实验几何展示。" />}
         <div style={{ color: '#ffca83' }}>{selectedRun.converged === 'no' && '本次分配未达到间隙阈值，结果是迭代上限内的近似解，不应当作已收敛结果；'}{selectedRun.unserved_demand_pax_per_hour > 0 && `仍有 ${formatNumber(selectedRun.unserved_demand_pax_per_hour, 0)} 人次/小时未被服务；这是候选路径与容量约束下未分配的模型需求，不代表观测到的拒载人数。`}</div>
         {selectedRun.source_experiment && <div>来源实验：{selectedRun.source_experiment}</div>}
@@ -343,9 +407,9 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
         </div>
       </div>}
       {selectedRun?.city_id === city.id && <>
-        <Button size="small" style={{ marginTop: 8 }} onClick={() => { onRunSelect(null); setInspectedRun(null); setNotice('已关闭客流图。'); }}>关闭客流图</Button>
+        <Button size="small" style={{ marginTop: 8 }} onClick={() => { detailRequest.current += 1; onRunSelect(null); setInspectedRun(null); setNotice('已关闭客流图。'); }}>关闭客流图</Button>
         <div style={label}>下载本次实验</div>
-        <a href={`/api/cities/${city.id}/runs/${selectedRun.run_id}/export`} download style={{ color: '#80d7a5' }}>下载完整实验包（ZIP）</a>
+        <ResultExports city={city} runId={selectedRun.run_id} comparisonIds={compareRunId ? [compareRunId] : []} />
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', fontSize: 11 }}>
           {resultFiles.map(([name, filename]) => (
             <a key={filename} style={{ color: '#80d7a5' }}
@@ -355,28 +419,30 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
           ))}
         </div>
       </>}
-      <div style={{ ...label, marginTop: 18 }}>三时段对比条件</div>
-      <div style={{ fontSize: 11, color: '#ffca83' }}>早高峰、平峰、晚高峰均需有实验；统一色标还要求同一需求版本、POI数量、小时总需求、模型参数、算法及频率来源/补全条件。条件不齐或历史字段缺失时，不视为严格可比；不同时段需求不同的结果只能作情景对照。</div>
-      <div style={{ fontSize: 11 }}>{Object.entries(PERIODS).map(([key, name]) => name + '：' + (runs.some(run => run.period === key) ? '已有实验' : '缺少实验')).join('；')}。存在三个时段不代表同一可比组。</div>
+      <div style={{ ...label, marginTop: 18 }}>三时段对比口径</div>
+      <Select aria-label="三时段比较口径" style={field} value={comparisonMode} onChange={setComparisonMode} options={[{value:'scenario',label:'分时情景对照：允许各时段总需求不同'},{value:'strict',label:'同条件分时对照：总需求与非时段参数相同'}]} />
+      {comparisonMode==='scenario' && <Alert type="info" style={{marginTop:7}} message="各时段需求可不同；流量差异反映需求与出行方向情景，不能归因于算法性能。" />}
+      <div style={{ fontSize: 11, color: '#ffca83' }}>分时匹配由服务端查询完整历史，不受列表每页30条或检索条件限制。同条件对照要求总需求及非时段条件相同；情景对照允许总需求不同。二者均不能把跨时段差异当成算法性能差异；历史缺失字段不补默认值。</div>
       {selectedRun && Object.keys(periodGroup).length > 0 && <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: 12, fontWeight: 600 }}>同条件三时段结果</div>
+        <div style={{ fontSize: 12, fontWeight: 600 }}>{comparisonMode==='strict'?'同条件三时段结果':'分时情景三时段结果'}</div>
         <div style={{ display:'grid', gridTemplateColumns:'minmax(0,1.3fr) repeat(3,minmax(0,1fr))', overflowWrap:'anywhere', gap:5, fontSize:11, marginTop:8 }}>
           <b>指标</b>{Object.values(PERIODS).map(name => <b key={name}>{name}</b>)}
           {[
+            ['总需求（人次/h）', row => formatNumber(row.hourly_demand_pax,0)],
             ['模型耗时（秒）', row => formatNumber(row.total_seconds)],
             ['相对间隙', row => typeof row.relative_gap === 'number' ? row.relative_gap.toExponential(2) : '未记录'],
             ['达到阈值', row => row.converged === 'yes' ? '是' : row.converged === 'no' ? '否' : '未记录'],
             ['可服务比例', row => typeof row.served_demand_share === 'number' ? `${(100*row.served_demand_share).toFixed(2)}%` : '未记录'],
             ['未服务（人次/h）', row => formatNumber(row.unserved_demand_pax_per_hour,0)],
             ['候选路径数', row => formatNumber(row.candidate_paths,0)],
-          ].map(([label,render]) => <React.Fragment key={label}><span>{label}</span>{Object.keys(PERIODS).map(period => <span key={period}>{periodGroup[period] ? render(periodGroup[period]) : '缺少同条件实验'}</span>)}</React.Fragment>)}
+          ].map(([label,render]) => <React.Fragment key={label}><span>{label}</span>{Object.keys(PERIODS).map(period => <span key={period}>{periodGroup[period] ? render(periodGroup[period]) : comparisonMode === 'strict' ? '缺少同条件实验' : '缺少匹配情景实验'}</span>)}</React.Fragment>)}
         </div>
         <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginTop:8 }}>{Object.keys(PERIODS).map(period => <Button key={period} size="small" disabled={!periodGroup[period]} onClick={() => viewRun(periodGroup[period])}>查看{PERIODS[period]}</Button>)}</div>
         <Button size="small" style={{marginTop:8}} onClick={exportPeriods}>导出三时段对照CSV</Button>
-        <div style={{fontSize:11,color:'#9babb8',marginTop:5}}>按当前实验匹配同输入、同需求总量及同参数记录；每个时段采用最近记录，不把较短运行时间当作预测更准确。</div>
+        <div style={{fontSize:11,color:'#9babb8',marginTop:5}}>按所选比较口径匹配记录；每个时段采用最近记录。情景对照允许总需求不同，不能将用时差异解释为算法优劣。</div>
       </div>}
       {selectedRun?.city_id === city.id && runs.length > 1 && <>
-        <div style={label}>对比同城另一组实验</div>
+        <div style={label}>对比同城另一组实验（可检索或加载更多，不限最近30条）</div>
         <Select style={field} allowClear placeholder="选择对比实验" value={compareRunId}
           onChange={setCompareRunId}
           options={runs.filter(run => run.run_id !== selectedRun.run_id).map(run => ({
@@ -394,6 +460,7 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
             parameterSignature(compareRun) !== parameterSignature(selectedRun)) &&
             <Alert style={{ marginTop: 8 }} type="warning" message="两次实验的时段、需求、POI数量、模型参数或发车间隔假设不同；差异不能直接归因于求解算法。" />}
           <div style={{ display: 'grid', gridTemplateColumns: '1.15fr 1fr 1fr', gap: 4, marginTop: 9, fontSize: 11, color: '#c8d7e4' }}>
+            <Button style={{gridColumn:'1 / -1'}} size="small" onClick={()=>onCompare?.({left:selectedRun,right:compareRun})}>联动地图 / 路段差值对照</Button>
             <b>指标</b><b>当前实验</b><b>对比实验</b>
             {comparisonRows.map(([name, render]) => <React.Fragment key={name}>
               <span>{name}</span><span>{render(selectedRun)}</span><span>{render(compareRun)}</span>

@@ -124,3 +124,20 @@
     border-color: rgba(255, 255, 255, 0.15) !important;
     color: rgba(255, 255, 255, 0.45) !important;
 }
+/* Keep the map usable on small screens without changing thematic colors. */
+.sidebar-toggle {
+    position:absolute;top:24px;left:24px;z-index:10;
+    padding:8px 10px;border:1px solid #ffffff33;border-radius:7px;
+    background:#142132;color:#e3edf4;cursor:pointer;
+}
+.floating-sidebar .sidebar-panel {padding-top:36px;box-sizing:border-box;}
+.sidebar-collapsed .sidebar-toggle {left:16px;top:16px;}
+.sidebar-collapsed .assignment-comparison-view {padding-left:16px !important;}
+.floating-sidebar input,.floating-sidebar select {max-width:100%;box-sizing:border-box;}
+.floating-sidebar button {white-space:normal;}
+@media(max-width:640px) {
+    .floating-sidebar {width:calc(100vw - 24px);left:12px;top:58px;max-height:calc(100dvh - 70px);}
+    .floating-sidebar .sidebar-panel {height:calc(100dvh - 70px) !important;}
+    .sidebar-toggle {left:12px;top:12px;}
+    .assignment-comparison-view {padding-left:16px !important;padding-top:58px !important;}
+}

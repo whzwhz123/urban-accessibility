@@ -11,8 +11,8 @@ def main():
     datasets=[data/'CPTOND-2025/city_list/AMap_adcode_citycode.csv',data/'CPTOND-2025/dataset/bus/shapefiles']
     if missing:print('缺少Python依赖：'+', '.join(missing)+'；请安装Back_end/requirements.txt',file=sys.stderr)
     for file in datasets:
-        if not file.exists():print('缺少本地数据：'+str(file),file=sys.stderr)
-    if missing or any(not file.exists() for file in datasets):return 1
+        if not file.exists():print('未配置全国数据集，可在界面注册城市并上传自有数据：'+str(file))
+    if missing:return 1
     import numpy
     if int(numpy.__version__.split('.')[0])>=2:print('当前项目使用NumPy<2，请使用受约束的依赖环境',file=sys.stderr);return 1
     print('本地依赖与城市目录检查通过');return 0

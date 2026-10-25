@@ -47,8 +47,9 @@ def _source_signature(paths):
 
 def cached_city_network(city, bus_dir: Path, output_root: Path):
     folder = bus_dir / city['id']
-    stops_path = next(folder.glob('*_bus_stops.shp'))
-    segments_path = next(folder.glob('*_bus_segments.shp'))
+    stops_path = next(folder.glob('*_bus_stops.shp'), None)
+    segments_path = next(folder.glob('*_bus_segments.shp'), None)
+    if stops_path is None or segments_path is None:return None
     signature = {'inputs': _source_signature((stops_path, segments_path)), 'schema': 3, 'metric_crs': metric_crs(city)}
     output_dir = output_root / city['id'] / 'network'
     manifest = output_dir / 'network_manifest.json'

@@ -1,6 +1,11 @@
+import TaskControls from './TaskControls';
+import DataIntakePanel from './DataIntakePanel';
+import TimetableImportPanel from './TimetableImportPanel';
+import RegisterCity from './RegisterCity';
 import CustomInputsPanel from './CustomInputsPanel';
 import React, { useEffect, useState, useRef } from 'react';
 import { Alert, Button, Select, Spin } from 'antd';
+import {readJson} from '../../utils/localApi';
 
 const CitySelector = ({ city, onCityChange }) => {
   const [cities, setCities] = useState([]);
@@ -40,14 +45,16 @@ const CitySelector = ({ city, onCityChange }) => {
     setJob(null);
     setTaskError('');
     setService(null);
+    const own={...city};
     fetch(`/api/cities/${encodeURIComponent(city.id)}/inputs`, { signal: controller.signal })
-      .then(response => response.json())
+      .then(readJson)
       .then(data => {
+        if(controller.signal.aborted || !sameCity(own))return;
         setInputs({ poi: data.poi, network: data.network });
         setService(data.service);
         setJob(data.job);
       })
-      .catch(() => {});
+      .catch(error => {if(error.name!=='AbortError' && sameCity(own))setTaskError(error.message);});
     return () => controller.abort();
   }, [city.id, city.custom_input_version, revision]);
 
@@ -63,7 +70,7 @@ const CitySelector = ({ city, onCityChange }) => {
           if (next.status === 'completed') { setInputs(next.result); onCityChange({ ...current.current, network_prepared: !!next.result.network, poi_prepared: !!next.result.poi, input_revision: (current.current.input_revision || 0) + 1 }); }
           if (next.status === 'failed') setTaskError(next.error || '数据处理失败');
         })
-        .catch(() => setTaskError('任务状态读取失败，请重试'));
+        .catch(() => {if(sameCity(own))setTaskError('任务状态读取失败，请重试');});
     }, 1500);
     return () => clearInterval(timer);
   }, [job?.id, job?.status]);
@@ -71,7 +78,7 @@ const CitySelector = ({ city, onCityChange }) => {
   const selected = cities.find(item => item.id === city.id) || city;
   const options = cities.map(item => ({
     value: item.id,
-    label: item.province === item.name ? item.name : `${item.name} · ${item.province}`,
+    label: !item.province || item.province === item.name ? item.name : `${item.name} · ${item.province}`,
     search: `${item.name} ${item.province || ''} ${item.id}`.toLowerCase(),
   }));
   const preparing = job && ['queued', 'running'].includes(job.status);
@@ -112,7 +119,10 @@ const CitySelector = ({ city, onCityChange }) => {
 
   return (
     <div style={{ marginBottom: 18 }}>
+      <RegisterCity onRegistered={next => { onCityChange(next); setRevision(value => value + 1); }} />
       <CustomInputsPanel city={city} onImported={result => { onCityChange(result.city); setRevision(previous => previous + 1); }} />
+      <details style={{color:'#c8d7e4',marginBottom:12}}><summary>导入自有线网和POI（字段映射）</summary><DataIntakePanel city={city} onImported={result => { onCityChange(result.city); setRevision(previous => previous + 1); }} /></details>
+      <details style={{color:'#c8d7e4',marginBottom:12}}><summary>从时刻表或高德班次文本导入发车间隔</summary><TimetableImportPanel city={city} onImported={result => { setService(result); setRevision(previous => previous + 1); }} /></details>
       <div style={{ color: '#e3edf4', fontSize: 14, fontWeight: 700, marginBottom: 8 }}>选择城市</div>
       <Select
         showSearch
@@ -133,17 +143,18 @@ const CitySelector = ({ city, onCityChange }) => {
           <div>省级 POI：{selected.poi_available ? selected.poi_file : '未找到对应省份数据'}</div>
           {inputs?.network && <div style={{ color: '#80d7a5' }}>线网已准备：{inputs.network.merged_stations.toLocaleString()} 站，{inputs.network.topology_edges.toLocaleString()} 条拓扑边，路段映射率 {(inputs.network.mapped_segment_share * 100).toFixed(1)}%</div>}
           {inputs?.network && <div>线路可沿拓扑走通：{inputs.network.route_directions_ready.toLocaleString()} / {inputs.network.route_directions.toLocaleString()} 个方向；{inputs.network.route_directions_missing_edge.toLocaleString()} 个方向缺少物理边。</div>}
-          {inputs?.network && <div>当前线网没有逐线路发车间隔。<a href={`/api/cities/${encodeURIComponent(city.id)}/headway-template`} download style={{ color: '#80d7a5' }}>下载发车间隔模板</a>，按分钟填写高峰和平峰间隔；也支持peak_frequency_per_hour、flat_frequency_per_hour（班次/小时）。缺失线路使用可设置的默认值。</div>}
+          {inputs?.network && <div>逐线路发车信息请以上传记录为准。<a href={`/api/cities/${encodeURIComponent(city.id)}/headway-template`} download style={{ color: '#80d7a5' }}>下载发车间隔模板</a>，按分钟填写高峰和平峰间隔；也支持peak_frequency_per_hour、flat_frequency_per_hour（班次/小时）。缺失线路使用可设置的默认值。</div>}
           {inputs?.network && <div style={{ marginTop: 6 }}>
             <label style={{ cursor: 'pointer', color: '#80d7a5' }}>
               {uploading ? '正在导入发车间隔…' : '导入已填写的发车间隔 CSV'}
               <input type="file" accept=".csv,text/csv" onChange={uploadHeadways} disabled={uploading} style={{ display: 'none' }} />
             </label>
           </div>}
-          {service && <div>已提供发车间隔：高峰 {service.peak_headway_routes.toLocaleString()} / {service.topology_ready_routes.toLocaleString()}，平峰 {service.flat_headway_routes.toLocaleString()} / {service.topology_ready_routes.toLocaleString()} 个可用线路方向。{!service.all_ready_routes_covered && '缺失线路将使用可设置的默认间隔，结果会记录补全比例。'}</div>}
+          {service && <div>已提供发车间隔：早高峰 {(service.am_headway_routes ?? service.peak_headway_routes ?? 0).toLocaleString()}，平峰 {(service.flat_headway_routes ?? 0).toLocaleString()}，晚高峰 {(service.pm_headway_routes ?? service.peak_headway_routes ?? 0).toLocaleString()}；共 {(service.topology_ready_routes ?? 0).toLocaleString()} 个可用线路方向。{!service.all_ready_routes_covered && '缺失线路将使用可设置的默认间隔，结果会记录补全比例。'}</div>}
           {inputs?.poi && <div style={{ color: '#80d7a5' }}>本市 POI 已准备：{inputs.poi.poi_count.toLocaleString()} 个</div>}
           {inputs?.poi?.scanned_rows === 1048575 && <div style={{ color: '#ffca83' }}>省级源文件恰有 1,048,575 条记录，可能受 Excel 行数上限截断；请核实数据完整性。</div>}
-          {preparing && <div>正在处理：{job.phase || '等待开始'}；已扫描 {job.scanned_rows.toLocaleString()} 条 POI</div>}
+          {preparing && <div>正在处理：{job.phase || '等待开始'}；已扫描 {(job.scanned_rows || 0).toLocaleString()} 条 POI</div>}
+          <TaskControls job={job} onChange={setJob} />
           {taskError && <div style={{ color: '#ffad99' }}>{taskError}</div>}
           {selected.poi_available && selected.network_complete && !(inputs?.network && inputs?.poi) && (
             <Button size="small" loading={preparing} onClick={prepareInputs} style={{ marginTop: 7 }}>
