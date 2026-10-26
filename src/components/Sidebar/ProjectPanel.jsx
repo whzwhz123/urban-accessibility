@@ -15,17 +15,17 @@ const ProjectPanel = ({ city, demandRun, selectedRun, compositeRun, workspace, o
   const [result, setResult] = useState(null);
   const currentCity = useRef(city?.id);
   const operation = useRef(0);
-  currentCity.current = city?.id;
+  currentCity.current = JSON.stringify([city?.id, city?.custom_input_version]);
 
   useEffect(() => {
-    operation.current += 1;
+    const token = ++operation.current;
     setRestoreInputs(false); setSelected(null); setProjects([]); setResult(null); setError(''); setBusy(false);
     const controller = new AbortController();
     if (city?.id) fetch(`/api/cities/${encodeURIComponent(city.id)}/projects`, { signal: controller.signal })
-      .then(readJson).then(value => setProjects(value.projects || []))
-      .catch(failure => { if (failure.name !== 'AbortError') setError(failure.message); });
+      .then(readJson).then(value => { if (!controller.signal.aborted && operation.current === token) setProjects(value.projects || []); })
+      .catch(failure => { if (!controller.signal.aborted && operation.current === token && failure.name !== 'AbortError') setError(failure.message); });
     return () => controller.abort();
-  }, [city?.id]);
+  }, [city?.id, city?.custom_input_version]);
 
   const perform = async action => {
     const ownCity = currentCity.current;

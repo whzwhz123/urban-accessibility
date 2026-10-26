@@ -443,7 +443,7 @@ const CityAssignmentPanel = ({ city, selectedRun: externalRun, onRunSelect, onDe
       </div>}
       {selectedRun?.city_id === city.id && runs.length > 1 && <>
         <div style={label}>对比同城另一组实验（可检索或加载更多，不限最近30条）</div>
-        <Select style={field} allowClear placeholder="选择对比实验" value={compareRunId}
+        <Select aria-label="对比实验" style={field} allowClear placeholder="选择对比实验" value={compareRunId}
           onChange={setCompareRunId}
           options={runs.filter(run => run.run_id !== selectedRun.run_id).map(run => ({
             value: run.run_id,

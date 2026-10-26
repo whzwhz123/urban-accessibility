@@ -1,3 +1,4 @@
+import {featureBounds,boundsView} from '../../utils/mapViewport';
 import {ImageExportControls} from '../Sidebar/ResultExports';
 import {composeMapCanvas as captureMap} from '../../utils/mapExport';
 import React, { useMemo, useState, useEffect, useCallback, useRef } from 'react';
@@ -727,6 +728,15 @@ const MapContainer = ({ data, vis, onToggleVis, tciSession, onSessionChange, com
         return counts;
     }, [rawCompositeData]);
     const compositeData = useMemo(() => rawCompositeData ? (compositeRun ? rawCompositeData : compositeDisplay(rawCompositeData)) : null, [rawCompositeData, compositeRun]);
+    const fittedLayer=useRef(null);
+    useEffect(()=>{
+        const active=vis?.composite || vis?.imbalance ? ['composite',compositeData] : vis?.tci ? ['tci',tciData] : vis?.coverage ? ['coverage',coverageData] : vis?.isochrone ? ['isochrone',isochroneData] : vis?.demand ? ['demand',demandData] : null;
+        if(!active?.[1]?.features?.length)return;
+        const key=[city.id,compositeRun?.run_id,demandRun?.run_id,active[0]].join(':');
+        if(fittedLayer.current===key)return;
+        const view=boundsView(featureBounds(active[1].features),window.innerWidth-420,window.innerHeight-180);
+        if(view){fittedLayer.current=key;setViewState(view);}
+    },[vis,compositeData,tciData,coverageData,isochroneData,demandData,city.id,compositeRun?.run_id,demandRun?.run_id]);
     const zoneIsoLoading = useRef(false);
 
     const workflow = compositeRun?.pipeline === 'city_workflow_v1';
@@ -1059,7 +1069,7 @@ const MapContainer = ({ data, vis, onToggleVis, tciSession, onSessionChange, com
             <DeckGL glOptions={{preserveDrawingBuffer:true}} viewState={viewState} onViewStateChange={({ viewState: vs }) => setViewState(vs)} controller={true} layers={layers}>
                 {MAPBOX_TOKEN ? <Map preserveDrawingBuffer {...viewState} mapboxAccessToken={MAPBOX_TOKEN} mapStyle={mapStyle} /> : <MapLibreMap preserveDrawingBuffer {...viewState} mapStyle={OPEN_BASEMAP} />}
             </DeckGL>
-            <div style={{position:'absolute',right:16,bottom:170,padding:8,zIndex:120,borderRadius:7,background:'rgba(255,255,255,.94)',color:'#183c38',maxWidth:290,fontSize:11}}>
+            <div style={{position:'absolute',right:16,bottom:320,padding:8,zIndex:120,borderRadius:7,background:'rgba(255,255,255,.94)',color:'#183c38',maxWidth:290,fontSize:11}}>
                 <ImageExportControls canvas={()=>captureMap(captureRoot.current)} metadata={{city:city.name,runId:compositeRun?.run_id || demandRun?.run_id,title:'城市公交评价地图',units:'见所选图层图例',legendLabel:Object.keys(vis || {}).filter(key=>vis[key]).join(' / '),coordinateSystem:'WGS84 / Web Mercator显示'}} />
             </div>
             <SearchBox city={city} stopsData={stopsData} onFlyTo={handleFlyTo} onHighlight={setHighlightStop} />

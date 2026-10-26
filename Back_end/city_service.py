@@ -75,7 +75,8 @@ def import_city_service(city, bus_dir: Path, output_root: Path, content: str, *,
             frequency = _headway(row.get(period + '_frequency_per_hour'))
             if headway and frequency and not math.isclose(headway, 60 / frequency, rel_tol=1e-5):
                 raise ValueError(f'{route_id}的{period}间隔与频率不一致')
-            value = headway or (60 / frequency if frequency else '')
+            converted = _headway(60 / frequency) if frequency else ''
+            value = headway or converted
             raw_source = row.get(period + '_headway_source', '')
             source = raw_source if provenance and raw_source in SOURCE_KINDS else 'user_csv'
             record[period + '_headway_min'] = value

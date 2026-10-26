@@ -138,6 +138,10 @@ def package(data, city, identity, kind='assignment', *, format='zip', include_re
             raise ValueError('没有可导出的几何结果')
     if format == 'zip':
         files.extend((folder / name, 'results/' + name) for name in RESULT_FILES if (folder / name).is_file())
+        demand_id=summary.get('demand_run_id')
+        if demand_id and RUN_ID.fullmatch(str(demand_id)):
+            demand=Path(data)/'demand_runs'/city/demand_id
+            files.extend((demand/name,'shared_demand/'+name) for name in ('summary.json','parameters.json') if (demand/name).is_file())
         # Only existing result plots, not source datasets or executable SVG/HTML.
         files.extend((p, 'results/' + p.name) for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg'))
     if include_report:

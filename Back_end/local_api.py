@@ -699,6 +699,12 @@ class Handler(BaseHTTPRequestHandler):
         city_match=re.match(r'^/api/cities/([^/]+)/',path)
         if city_match and ACTIVE_BATCHES.get(city_match.group(1)):
             self.respond({'error':'本城市批量流程运行中，请先停止批次再修改输入或启动其他任务'},409);return
+        if city_match:
+            city_id=city_match.group(1);action=path.split('/',4)[4]
+            groups=(ACTIVE_ASSIGNMENTS,ACTIVE_JOBS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)
+            if action=='prepare-inputs':groups=(ACTIVE_ASSIGNMENTS,ACTIVE_DEMANDS,ACTIVE_EVALUATIONS)
+            if action in ('headways','timetable','population','prepare-inputs','custom-inputs','custom-inputs/activate') and any(group.get(city_id) for group in groups):
+                self.respond({'error':'本城市正在计算，请先结束任务再修改计算输入'},409);return
         if path in ('/api/projects/export','/api/projects/import') or re.fullmatch(r'/api/projects/[0-9a-f]{32}/restore',path):
             from .project_bundle import export_project,import_project,restore_project
             try:
@@ -728,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path.endswith('/import'):
                     self.respond(import_project(DATA,raw),201);return
                 value=json.loads(raw)
+                if not isinstance(value,dict):raise ValueError('工程导出配置必须为JSON对象')
                 city=BY_ID.get(value.get('city_id'))
                 if city is None:raise ValueError('城市不存在')
                 result=export_project(DATA,city,value.get('payload',{}),include_inputs=bool(value.get('include_inputs')),include_results=bool(value.get('include_results')))

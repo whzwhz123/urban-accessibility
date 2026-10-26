@@ -105,7 +105,7 @@ export function ImageExportControls({ canvas, metadata = {}, disabled = false })
   return <section aria-label="地图导出">
     <button type="button" disabled={disabled} onClick={png}>导出地图 PNG</button>{' '}
     <button type="button" disabled={disabled} onClick={print}>地图打印 / PDF</button>
-    <small style={{ display: 'block' }}>截图来自当前画布；若地图空白，请由地图集成方启用截图缓冲或传入刚完成绘制的画布。</small>
+    <small style={{ display: 'block' }}>导出当前地图范围和图层，并附带城市、版本与图例信息。</small>
     {error && <p role="alert">{error}</p>}
   </section>;
 }

@@ -10,6 +10,7 @@ def registered(data):
 
 
 def register(data, values, existing):
+    if not isinstance(values,dict):raise ValueError('城市信息必须为JSON对象')
     identity=str(values.get('id','')).strip()
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{1,63}',identity):raise ValueError('城市ID用英文字母开头，2–64位字母、数字、下划线或短横线')
     if identity in existing:raise ValueError('城市ID已存在，请直接选择该城市')

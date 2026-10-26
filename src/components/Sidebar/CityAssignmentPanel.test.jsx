@@ -15,7 +15,7 @@ jest.mock('antd', () => {
 });
 
 const city = { id: 'Fixture', name: '示例城市' };
-const demandRun = { run_id: 'shared', parameters: { hourly_demands: { am_peak: 50000, pm_peak: 60000 } } };
+const demandRun = { city_id: 'Fixture', run_id: 'shared', parameters: { hourly_demands: { am_peak: 50000, pm_peak: 60000 } } };
 const parameters = { paths_per_transfer: 3, access_station_count: 2, max_walk_distance_m: 700,
   min_od_distance_km: 1, max_od_distance_km: 20, max_transfers: 1, transfer_penalty_min: 3,
   bus_speed_kmh: 16, vehicle_capacity: 65, max_iterations: 40, relative_gap_tol: 1e-3 };
@@ -96,16 +96,17 @@ test('停止请求不误报已停止，等待安全边界', async () => {
 
 test('历史实验需求不同仍能查看详情，并可切换需求后显示客流图', async () => {
   const onRunSelect = jest.fn(); const onDemandChange = jest.fn();
-  const summary = { ...demandRun, run_id: 'other' };
-  mockApi({ runs: [fixtureRun], handle: url => url.endsWith('/summary') ? Promise.resolve(response(summary)) : null });
+  const summary = { ...demandRun, run_id: 'other', current_inputs: true };
+  mockApi({ runs: [fixtureRun], handle: url => url.endsWith('/runs/historical/summary') ? Promise.resolve(response(fixtureRun)) : url.endsWith('/demand-runs/other/summary') ? Promise.resolve(response(summary)) : url.endsWith('/demand-runs') ? Promise.resolve(response({ runs: [summary] })) : null });
   const props = { city, demandRun, onRunSelect, onDemandChange };
   const view = render(<CityAssignmentPanel {...props} />);
   await screen.findByLabelText('已有实验');
   fireEvent.change(screen.getByLabelText('已有实验'), { target: { value: 'historical' } });
-  expect(screen.getByText(/已打开历史实验详情/)).toBeTruthy();
-  expect(screen.getByText('下载完整实验包（ZIP）').getAttribute('href')).toContain('/historical/export');
+  await screen.findByText(/已打开完整历史详情/);
+  expect(screen.getByText('完整结果 ZIP').disabled).toBe(false);
+  expect(fetch.mock.calls.some(([url]) => url.includes('/export'))).toBe(false);
   expect(onRunSelect).toHaveBeenLastCalledWith(null);
-  fireEvent.click(screen.getByText('切换历史需求并显示客流图'));
+  fireEvent.click(screen.getByText('加载对应有效需求并显示客流图'));
   await waitFor(() => expect(onDemandChange).toHaveBeenCalledWith(summary));
   view.rerender(<CityAssignmentPanel {...props} demandRun={summary} />);
   await waitFor(() => expect(onRunSelect).toHaveBeenLastCalledWith(fixtureRun));
@@ -113,17 +114,17 @@ test('历史实验需求不同仍能查看详情，并可切换需求后显示�
 
 test('历史需求读取失败可见，不改变当前需求', async () => {
   const onDemandChange = jest.fn();
-  mockApi({ runs: [fixtureRun], handle: url => url.endsWith('/summary') ? Promise.resolve({ ok: false, json: async () => ({ error: '需求版本不存在' }) }) : null });
+  mockApi({ runs: [fixtureRun], handle: url => url.endsWith('/runs/historical/summary') ? Promise.resolve(response(fixtureRun)) : url.endsWith('/summary') ? Promise.resolve({ ok: false, json: async () => ({ error: '需求版本不存在' }) }) : null });
   render(<CityAssignmentPanel city={city} demandRun={demandRun} onDemandChange={onDemandChange} onRunSelect={jest.fn()} />);
   fireEvent.change(await screen.findByLabelText('已有实验'), { target: { value: 'historical' } });
-  fireEvent.click(screen.getByText('切换历史需求并显示客流图'));
+  fireEvent.click(await screen.findByText('加载对应有效需求并显示客流图'));
   await screen.findByText('无法切换历史需求：需求版本不存在');
   expect(onDemandChange).not.toHaveBeenCalled();
 });
 
 test('城市切换后迟到的任务历史与实验列表不回写', async () => {
   const oldHistory = deferred(); const oldRuns = deferred();
-  mockApi({ handle: url => url === '/api/jobs?city_id=Fixture' ? oldHistory.promise : url === '/api/cities/Fixture/runs' ? oldRuns.promise : null });
+  mockApi({ handle: url => url === '/api/jobs?city_id=Fixture' ? oldHistory.promise : url.startsWith('/api/cities/Fixture/runs?') ? oldRuns.promise : null });
   const props = { demandRun, onRunSelect: jest.fn() };
   const view = render(<CityAssignmentPanel {...props} city={city} />);
   view.rerender(<CityAssignmentPanel {...props} city={{ id: 'Next' }} />);
@@ -181,8 +182,9 @@ test('未收敛与未服务需求有语义说明，三时段缺失条件可见',
   await act(async () => { await Promise.resolve(); });
   expect(screen.getByText(/不应当作已收敛结果/)).toBeTruthy();
   expect(screen.getByText(/不代表观测到的拒载人数/)).toBeTruthy();
-  expect(screen.getByText(/早高峰：缺少实验；平峰：缺少实验；晚高峰：缺少实验/)).toBeTruthy();
-  expect(screen.getByText(/条件不齐或历史字段缺失/)).toBeTruthy();
+  expect(screen.getAllByText('缺少匹配情景实验').length).toBeGreaterThan(0);
+  expect(screen.getByText('查看平峰').disabled).toBe(true);
+  expect(screen.getByText('查看晚高峰').disabled).toBe(true);
 });
 
 test('恢复请求在切换城市后返回时不污染新城市任务', async () => {

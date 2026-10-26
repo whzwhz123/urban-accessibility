@@ -24,9 +24,12 @@ const textNumber=(value,digits=1)=>numeric(value)===null?'未记录':Number(valu
 
 const cityZoom = city => {
   if (!city.bounds) return 10;
-  const [west, south, east, north] = city.bounds;
-  const span = Math.max((east - west) * Math.cos(city.center[1] * Math.PI / 180), north - south);
-  return Math.max(6, Math.min(11, Math.log2(360 / Math.max(span, 0.01)) - 2));
+  const [west,south,east,north]=city.bounds;
+  const width=Math.max(280,window.innerWidth-400),height=Math.max(280,window.innerHeight-180);
+  const mercator=lat=>Math.log(Math.tan(Math.PI/4+Math.max(-85,Math.min(85,lat))*Math.PI/360));
+  const zx=Math.log2(width*360/(512*Math.max(east-west,.001)));
+  const zy=Math.log2(height*2*Math.PI/(512*Math.max(mercator(north)-mercator(south),.00001)));
+  return Math.max(4,Math.min(14,zx,zy));
 };
 
 const ramp = (value, maximum) => {

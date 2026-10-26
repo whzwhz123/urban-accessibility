@@ -83,7 +83,7 @@ def export_project(data, city, payload, include_inputs=False, include_results=Fa
         # Source POI dependencies can refer to an entire province. Only the
         # generated city CSV is a transferable POI source, including explicit dependencies.
         declared_poi = city.get('poi_file')
-        poi_dir = _inside(root, (city.get('source_directory_override') or {}).get('poi_dir', 'POI'))
+        poi_dir = _inside(root, (portable_city.get('source_directory_override') or {}).get('poi_dir', 'POI'))
         if kind == 'inputs' and (relative.split('/')[0].casefold() == 'poi'
                 or (declared_poi and path.resolve() == (poi_dir / declared_poi).resolve())):
             return
@@ -190,6 +190,13 @@ def export_project(data, city, payload, include_inputs=False, include_results=Fa
 
 
 def import_project(data, content):
+    try:
+        return _import_project(data, content)
+    except (zipfile.BadZipFile, KeyError, TypeError, AttributeError) as error:
+        raise ValueError('工程文件损坏、格式错误或缺少必需清单') from error
+
+
+def _import_project(data, content):
     """Stage raw ZIP bytes under projects/<new id>/data; no activation or pickle loading.
 
     API must scope file reads to returned data_root for this manually opened project.
@@ -213,6 +220,8 @@ def import_project(data, content):
             if name != 'project.json' and (not name.startswith('data/') or Path(name).suffix.lower() not in SAFE_SUFFIXES):
                 raise ValueError('Unsupported project attachment: ' + name)
         manifest = json.loads(archive.read('project.json'))
+        if not isinstance(manifest,dict) or not isinstance(manifest.get('city'),dict) or not isinstance(manifest.get('files'),list):
+            raise ValueError('工程清单格式错误')
         if manifest.get('schema') != SCHEMA:
             raise ValueError('Unsupported project schema')
         city_id = _relative(manifest['city']['id'])
@@ -378,6 +387,10 @@ def restore_project(data, project_id, *, restore_inputs=False, original_city=Non
     Input activation is opt-in, always imports a new version, and never replaces
     existing source datasets or relaxes historical result signatures.
     """
+    if original_city is not None:
+        if not isinstance(project_id,str) or not re.fullmatch(r'[0-9a-f]{32}',project_id):raise ValueError('Invalid project id')
+        saved=json.loads((Path(data)/'projects'/project_id/'project.json').read_text(encoding='utf-8'))
+        if original_city['id']!=saved['city']['id']:raise ValueError('Original city does not match project city')
     project = restore_references(data, project_id)
     project.update(input_status='not_requested', city_status='unchanged')
     if original_city is not None:

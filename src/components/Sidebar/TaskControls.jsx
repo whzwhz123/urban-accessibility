@@ -5,8 +5,8 @@ const SUPPORTED = ['assignment', 'batch', 'demand', 'workflow', 'inputs'];
 
 export default function TaskControls({job, onChange}) {
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
-  const currentId = useRef(job?.id);
-  currentId.current = job?.id;
+  const scope = useRef(null);
+  if (scope.current?.id !== job?.id) scope.current = { id: job?.id };
   useEffect(() => { setBusy(false); setError(''); }, [job?.id]);
   if (!job) return null;
   const supported = SUPPORTED.includes(job.kind);
@@ -17,14 +17,15 @@ export default function TaskControls({job, onChange}) {
   const action = supported && job.id ? running ? 'cancel' : recovering && hasSnapshot ? 'resume' : null : null;
   const control = async () => {
     const identity = job.id;
+    const own = scope.current;
     setBusy(true); setError('');
     try {
       const next = await fetch(`/api/jobs/${encodeURIComponent(identity)}/${action}`, {method: 'POST'}).then(readJson);
-      if (currentId.current === identity) onChange?.(next);
+      if (scope.current === own) onChange?.(next);
     } catch (failure) {
-      if (currentId.current === identity) setError(failure.message);
+      if (scope.current === own) setError(failure.message);
     } finally {
-      if (currentId.current === identity) setBusy(false);
+      if (scope.current === own) setBusy(false);
     }
   };
   return <div style={{marginTop: 6, fontSize: 11}}>

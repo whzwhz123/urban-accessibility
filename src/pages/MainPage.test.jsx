@@ -4,6 +4,7 @@ import MainPage from './MainPage';
 import { WORKSPACE_KEY, DEFAULT_VIS } from './workspaceState';
 
 let mockSidebar;
+jest.mock('../components/Map/AssignmentCompareMap', () => () => <div data-testid="comparison-map" />);
 jest.mock('../components/Map/MapContainer', () => () => <div data-testid="evaluation-map" />);
 jest.mock('../components/Map/CityPreviewMap', () => ({ run }) => <div data-testid="flow-map">{run?.run_id}</div>);
 jest.mock('../components/Sidebar/SidebarPanel', () => props => { mockSidebar = props; return <div data-testid="sidebar">{props.city.name}</div>; });
